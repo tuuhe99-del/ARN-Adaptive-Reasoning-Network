@@ -267,6 +267,11 @@ class ConsolidationEngine:
                  min_cluster_size: int = 2,
                  contradiction_threshold: float = 0.3,
                  max_semantic_nodes: int = 2048):
+        # similarity_threshold controls when two episodes are merged into the
+        # same cluster during consolidation. It must be calibrated per embedding
+        # model — each tier has different score distributions.
+        # Pass the value from EmbeddingEngine._config['consolidation_similarity_threshold']
+        # rather than using this hardcoded default (0.55 is tuned for nano/MiniLM only).
         self.similarity_threshold = similarity_threshold
         self.min_cluster_size = min_cluster_size
         self.contradiction_threshold = contradiction_threshold
@@ -644,7 +649,14 @@ class ARNv9:
         self.working_memory = WorkingMemory(
             max_slots=7, embedding_dim=self.embedder.embedding_dim
         )
+        # Read per-model consolidation threshold from embedder config.
+        # Falls back to 0.55 (MiniLM default) if key is missing for compatibility
+        # with any third-partyly constructed EmbeddingEngine instances.
+        consolidation_sim_threshold = self.embedder._config.get(
+            'consolidation_similarity_threshold', 0.55
+        )
         self.consolidation_engine = ConsolidationEngine(
+            similarity_threshold=consolidation_sim_threshold,
             max_semantic_nodes=semantic_capacity
         )
         

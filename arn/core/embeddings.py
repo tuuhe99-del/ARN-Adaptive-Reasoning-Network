@@ -36,6 +36,10 @@ MODEL_CONFIGS = {
         "passage_prefix": "",
         "low_conf_threshold": 0.40,
         "high_conf_threshold": 0.55,
+        # Consolidation clustering threshold calibrated for MiniLM score distribution.
+        # MiniLM scores spread wide (unrelated ~0.1, related ~0.5), so 0.45 safely
+        # groups genuinely similar episodes without over-merging.
+        "consolidation_similarity_threshold": 0.45,
     },
     "small": {
         "name": "BAAI/bge-small-en-v1.5",
@@ -50,6 +54,9 @@ MODEL_CONFIGS = {
         "passage_prefix": "",
         "low_conf_threshold": 0.52,
         "high_conf_threshold": 0.64,
+        # BGE-small scores are tighter than MiniLM; raise threshold slightly
+        # to avoid merging episodes that are merely topically adjacent.
+        "consolidation_similarity_threshold": 0.55,
     },
     "balanced": {
         "name": "sentence-transformers/all-mpnet-base-v2",
@@ -64,6 +71,8 @@ MODEL_CONFIGS = {
         "passage_prefix": "",
         "low_conf_threshold": 0.40,
         "high_conf_threshold": 0.55,
+        # mpnet scores similar to MiniLM in spread; 0.50 is a safe merge boundary.
+        "consolidation_similarity_threshold": 0.50,
     },
     "base": {
         "name": "BAAI/bge-base-en-v1.5",
@@ -78,6 +87,9 @@ MODEL_CONFIGS = {
         "passage_prefix": "",
         "low_conf_threshold": 0.55,
         "high_conf_threshold": 0.65,
+        # BGE-base produces compressed scores (unrelated ~0.35, related ~0.65).
+        # Use a higher threshold so only strongly similar episodes consolidate.
+        "consolidation_similarity_threshold": 0.62,
     },
     "base-e5": {
         "name": "intfloat/e5-base-v2",
@@ -92,6 +104,9 @@ MODEL_CONFIGS = {
         "passage_prefix": "passage: ",
         "low_conf_threshold": 0.78,
         "high_conf_threshold": 0.85,
+        # e5 scores are very compressed (unrelated ~0.70+). Use a high threshold
+        # to avoid collapsing distinct memories into the same semantic node.
+        "consolidation_similarity_threshold": 0.82,
     },
     "large": {
         "name": "BAAI/bge-large-en-v1.5",
@@ -106,6 +121,8 @@ MODEL_CONFIGS = {
         "passage_prefix": "",
         "low_conf_threshold": 0.55,
         "high_conf_threshold": 0.65,
+        # BGE-large same distribution as bge-base; match its consolidation threshold.
+        "consolidation_similarity_threshold": 0.62,
     },
 }
 
