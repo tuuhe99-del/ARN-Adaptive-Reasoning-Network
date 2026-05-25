@@ -1,0 +1,130 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  plumbing-tests:
+    name: Plumbing tests (no embedding model)
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install minimal dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy
+
+      - name: Verify degraded-mode detection works
+        run: |
+          python -c "
+          import sys
+          sys.path.insert(0, '.')
+          from arn_v9.core.embeddings import EmbeddingEngine
+          e = EmbeddingEngine(use_model=True)
+          assert e.is_degraded, 'Should be degraded without sentence-transformers'
+          print('OK: degraded mode correctly detected')
+          "
+
+      - name: Run plumbing tests (expects semantic tests to skip)
+        run: python arn_v9/tests/test_all.py
+
+  full-tests:
+    name: Full test suite (with embedding model)
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Cache HuggingFace models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-cache-${{ runner.os }}-minilm-v1
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Environment check
+        run: python arn_v9/tests/check_env.py
+
+      - name: Run full test suite
+        run: python arn_v9/tests/test_all.py
+
+      - name: Run adversarial stress test (nano tier)
+        run: python arn_v9/benchmarks/stress_test.py nano
+
+  api-smoke:
+    name: API server smoke test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache HuggingFace models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-cache-${{ runner.os }}-minilm-v1
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[api]"
+
+      - name: Start API server and run smoke test
+        run: |
+          python -m uvicorn arn_v9.api.server:app --host 127.0.0.1 --port 8742 &
+          SERVER_PID=$!
+          sleep 20  # Wait for model load
+
+          # Health check
+          curl -sf http://127.0.0.1:8742/v1/health | python -m json.tool
+
+          # Store + recall round-trip
+          curl -sf -X POST http://127.0.0.1:8742/v1/memory/store \
+            -H "Content-Type: application/json" \
+            -d '{"agent_id":"ci","content":"CI test fact","importance":0.5}' \
+            | python -m json.tool
+
+          RESULT=$(curl -sf -X POST http://127.0.0.1:8742/v1/memory/recall \
+            -H "Content-Type: application/json" \
+            -d '{"agent_id":"ci","query":"CI test","top_k":1}')
+          echo "$RESULT" | python -m json.tool
+
+          # Verify recall found it
+          echo "$RESULT" | python -c "
+          import json, sys
+          d = json.load(sys.stdin)
+          assert 'CI test' in d['results'][0]['content'], 'Recall did not find stored fact'
+          print('OK: store/recall round-trip works')
+          "
+
+          kill $SERVER_PID 2>/dev/null || true

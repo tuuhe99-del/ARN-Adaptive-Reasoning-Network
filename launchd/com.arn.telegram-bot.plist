@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.arn.telegram-bot</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/hustle/arn-v9-repo</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/env</string>
+        <string>python3</string>
+        <string>-m</string>
+        <string>arn_v9.scripts.telegram_bot</string>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>/Users/hustle/.arn_data/telegram_bot.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/hustle/.arn_data/telegram_bot.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONPATH</key>
+        <string>/Users/hustle/arn-v9-repo</string>
+    </dict>
+</dict>
+</plist>

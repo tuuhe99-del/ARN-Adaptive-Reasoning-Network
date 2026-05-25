@@ -1,0 +1,76 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# ARN data (user memory, don't commit)
+arn_data/
+.arn_data/
+*.db
+*.db-wal
+*.db-shm
+*.npy
+
+# Model cache
+.cache/
+huggingface/
+
+# Logs
+*.log
+
+# OS
+Thumbs.db
+
+# ARN secrets
+.api_key
+.model_fingerprint
+session_state.json
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Task outputs
+tasks/*.output
+/tmp/
+
+# Claude Code local settings (machine-specific)
+.claude/

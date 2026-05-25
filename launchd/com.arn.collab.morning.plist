@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.arn.collab.morning</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>-m</string>
+    <string>arn_v9.collab_runner</string>
+    <string>--repo-dir</string>
+    <string>/Users/hustle/arn-v9-repo</string>
+    <string>--data-dir</string>
+    <string>/Users/hustle/.arn_data</string>
+    <string>--task-id</string>
+    <string>morning-cycle</string>
+    <string>--review-chain</string>
+    <string>codex,claude,kimi</string>
+    <string>--force</string>
+    <string>--execute</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>9</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+  <key>WorkingDirectory</key>
+  <string>/Users/hustle/arn-v9-repo</string>
+  <key>StandardOutPath</key>
+  <string>/Users/hustle/.arn_data/collab/logs/launchd-morning.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/hustle/.arn_data/collab/logs/launchd-morning.err.log</string>
+</dict>
+</plist>

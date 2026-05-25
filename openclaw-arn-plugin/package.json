@@ -1,0 +1,18 @@
+{
+  "name": "openclaw-arn-memory-plugin",
+  "version": "1.0.0",
+  "description": "Inject Adaptive Reasoning Network (ARN) semantic memory into OpenClaw agent prompts",
+  "main": "index.js",
+  "type": "module",
+  "openclaw": {
+    "extensions": ["./index.js"]
+  },
+  "scripts": {
+    "test": "echo \"No tests yet\""
+  },
+  "keywords": ["openclaw", "arn", "memory", "agent"],
+  "license": "MIT",
+  "peerDependencies": {
+    "openclaw": ">=2026.4.0"
+  }
+}

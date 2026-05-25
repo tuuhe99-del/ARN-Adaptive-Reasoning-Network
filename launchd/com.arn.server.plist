@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.arn.server</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/hustle/arn-v9-repo</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Library/Frameworks/Python.framework/Versions/3.12/bin/python3</string>
+        <string>-m</string>
+        <string>uvicorn</string>
+        <string>arn_v9.api.server:app</string>
+        <string>--host</string>
+        <string>127.0.0.1</string>
+        <string>--port</string>
+        <string>8742</string>
+        <string>--workers</string>
+        <string>1</string>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>/Users/hustle/.arn_data/server.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/hustle/.arn_data/server_error.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>ARN_EMBEDDING_TIER</key>
+        <string>base</string>
+        <key>ARN_DATA_DIR</key>
+        <string>/Users/hustle/.arn_data</string>
+        <key>HOME</key>
+        <string>/Users/hustle</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>
