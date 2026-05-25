@@ -1,0 +1,16 @@
+# ARN v9 Requirements
+# For Raspberry Pi 5 (ARM64) deployment
+
+# Core
+numpy>=1.24.0
+sentence-transformers>=2.2.0    # ~22MB model on disk
+torch>=2.0.0                     # CPU-only for Pi 5
+
+# Storage  
+# sqlite3 is built into Python stdlib — no extra dep needed
+
+# Optional: ONNX Runtime for lighter inference on Pi
+# onnxruntime>=1.15.0           # Uncomment if using ONNX export
+
+# Development / Testing only
+scikit-learn>=1.3.0              # For clustering benchmarks

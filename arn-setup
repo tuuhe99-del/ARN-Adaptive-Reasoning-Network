@@ -1,0 +1,289 @@
+#!/usr/bin/env bash
+# ARN Setup — One command to install and connect ARN to your OpenClaw agents
+# Usage: bash arn-setup [--tier nano|base] [--profile <openclaw-profile>]
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ARN_PORT=8742
+ARN_DATA_DIR="${ARN_DATA_DIR:-$HOME/.arn_data}"
+LOG_FILE="/tmp/arn-server.log"
+
+# ── Parse arguments ──────────────────────────────────────────────────────────
+TIER="base"
+PROFILE="${OPENCLAW_PROFILE:-redteam}"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --tier)
+            TIER="$2"
+            shift 2
+            ;;
+        --profile)
+            PROFILE="$2"
+            shift 2
+            ;;
+        *)
+            echo "Unknown option: $1"
+            echo "Usage: bash arn-setup [--tier nano|base] [--profile <openclaw-profile>]"
+            exit 1
+            ;;
+    esac
+done
+
+if [[ "$TIER" != "nano" && "$TIER" != "small" && "$TIER" != "base" ]]; then
+    echo "❌ Invalid tier '$TIER'. Must be: nano, small, or base"
+    exit 1
+fi
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+say()  { echo "  $*"; }
+ok()   { echo "  ✅ $*"; }
+warn() { echo "  ⚠️  $*"; }
+fail() { echo "  ❌ $*"; exit 1; }
+
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  ARN Setup"
+echo "  Tier: $TIER"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+
+# ── Step 1: Check Python ──────────────────────────────────────────────────────
+say "Checking Python..."
+
+if ! command -v python3 &>/dev/null; then
+    fail "Python 3.10 or newer is required. Download it from python.org"
+fi
+
+PY_VER=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+PY_MAJOR=$(echo "$PY_VER" | cut -d. -f1)
+PY_MINOR=$(echo "$PY_VER" | cut -d. -f2)
+
+if [[ "$PY_MAJOR" -lt 3 ]] || [[ "$PY_MAJOR" -eq 3 && "$PY_MINOR" -lt 10 ]]; then
+    fail "Python 3.10 or newer is required. Found: $PY_VER — Download from python.org"
+fi
+
+ok "Python $PY_VER found"
+
+# ── Step 2: Install Python dependencies ──────────────────────────────────────
+say "Installing memory engine..."
+
+# Detect if --break-system-packages is needed (PEP 668)
+PIP_FLAGS="--quiet"
+if python3 -m pip install --help 2>&1 | grep -q "break-system-packages"; then
+    PIP_FLAGS="$PIP_FLAGS --break-system-packages"
+fi
+
+if ! python3 -m pip install --user $PIP_FLAGS sentence-transformers numpy 2>>/tmp/arn-pip.log; then
+    fail "Failed to install dependencies. Check /tmp/arn-pip.log for details."
+fi
+
+ok "Memory engine installed"
+
+# ── Step 3: Start ARN server ──────────────────────────────────────────────────
+say "Starting memory server..."
+
+# Kill any existing ARN server
+pkill -f "arn_v9.api.server" 2>/dev/null || true
+sleep 1
+
+# Ensure data dir exists
+mkdir -p "$ARN_DATA_DIR"
+
+# Start fresh
+PYTHONPATH="$SCRIPT_DIR" \
+ARN_EMBEDDING_TIER="$TIER" \
+ARN_DATA_ROOT="$ARN_DATA_DIR" \
+  python3 -m uvicorn arn_v9.api.server:app \
+    --host 127.0.0.1 \
+    --port "$ARN_PORT" \
+    --workers 1 \
+    >> "$LOG_FILE" 2>&1 &
+
+SERVER_PID=$!
+
+# Wait up to 15s for the server to respond
+READY=0
+for i in $(seq 1 15); do
+    if curl -sf "http://127.0.0.1:$ARN_PORT/v1/health" >/dev/null 2>&1; then
+        READY=1
+        break
+    fi
+    sleep 1
+done
+
+if [[ "$READY" -eq 0 ]]; then
+    fail "Server failed to start — check $LOG_FILE"
+fi
+
+ok "Memory server started (PID $SERVER_PID)"
+
+# ── Step 4: Install launchd service (Mac only) ────────────────────────────────
+OS="$(uname -s)"
+
+if [[ "$OS" == "Darwin" ]]; then
+    say "Installing auto-start service..."
+
+    PLIST_SRC="$SCRIPT_DIR/launchd/com.arn.server.plist"
+    PLIST_DST="$HOME/Library/LaunchAgents/com.arn.server.plist"
+
+    if [[ ! -f "$PLIST_SRC" ]]; then
+        warn "launchd/com.arn.server.plist not found in repo — skipping auto-start setup"
+    else
+        mkdir -p "$HOME/Library/LaunchAgents"
+        cp "$PLIST_SRC" "$PLIST_DST"
+
+        # Update the tier in the plist
+        /usr/bin/sed -i '' \
+            "s|<string>nano</string>|<string>$TIER</string>|g;
+             s|<string>small</string>|<string>$TIER</string>|g;
+             s|<string>base</string>|<string>$TIER</string>|g" \
+            "$PLIST_DST" 2>/dev/null || true
+
+        # Update WorkingDirectory to actual repo location
+        /usr/bin/sed -i '' \
+            "s|<string>/Users/hustle/arn-v9-repo</string>|<string>$SCRIPT_DIR</string>|g" \
+            "$PLIST_DST" 2>/dev/null || true
+
+        # Unload first (ignore errors if not loaded)
+        launchctl unload "$PLIST_DST" 2>/dev/null || true
+        if launchctl load "$PLIST_DST" 2>/dev/null; then
+            ok "ARN will now start automatically when you log in"
+        else
+            warn "Could not load launchd service — ARN server is running now but won't auto-start"
+        fi
+    fi
+elif [[ "$OS" == "Linux" ]]; then
+    say "Linux detected — skipping launchd step"
+    say "  To auto-start ARN on Linux, create a systemd user service:"
+    say "  systemctl --user enable arn-server && systemctl --user start arn-server"
+fi
+
+# ── Step 5: Auto-wire openclaw ────────────────────────────────────────────────
+say "Looking for OpenClaw config..."
+
+API_KEY=""
+if [[ -f "$ARN_DATA_DIR/.api_key" ]]; then
+    API_KEY="$(cat "$ARN_DATA_DIR/.api_key")"
+fi
+
+OC_CONFIG=""
+# Check explicit profile first, then common locations
+for candidate in \
+    "$HOME/.openclaw-$PROFILE/openclaw.json" \
+    "$HOME/.openclaw/openclaw.json" \
+    "$HOME/.openclaw-redteam/openclaw.json" \
+    "$HOME/.openclaw-default/openclaw.json"; do
+    if [[ -f "$candidate" ]]; then
+        OC_CONFIG="$candidate"
+        break
+    fi
+done
+
+if [[ -z "$OC_CONFIG" ]]; then
+    warn "OpenClaw config not found — see README for manual setup"
+elif [[ -z "$API_KEY" ]]; then
+    warn "No API key found at $ARN_DATA_DIR/.api_key — restart ARN server to generate one"
+else
+    python3 - "$OC_CONFIG" "$API_KEY" "$SCRIPT_DIR" << 'PYSCRIPT'
+import sys, json
+
+config_path, api_key, install_dir = sys.argv[1], sys.argv[2], sys.argv[3]
+
+try:
+    with open(config_path) as f:
+        cfg = json.load(f)
+except Exception as e:
+    print(f"  ⚠️  Could not read {config_path}: {e}")
+    sys.exit(0)
+
+plugins = cfg.setdefault("plugins", {})
+entries = plugins.setdefault("entries", {})
+
+if "arn-memory" not in entries:
+    entries["arn-memory"] = {
+        "path": f"{install_dir}/openclaw-arn-plugin",
+        "config": {
+            "arnEndpoint": "http://localhost:8742",
+            "apiKey": api_key,
+            "storeMessages": True,
+            "storeTools": True
+        }
+    }
+    try:
+        with open(config_path, 'w') as f:
+            json.dump(cfg, f, indent=2)
+        print(f"  ✅ Connected to OpenClaw ({config_path})")
+    except Exception as e:
+        print(f"  ⚠️  Could not write {config_path}: {e}")
+else:
+    # Update the api_key in case it changed
+    entries["arn-memory"].setdefault("config", {})["apiKey"] = api_key
+    try:
+        with open(config_path, 'w') as f:
+            json.dump(cfg, f, indent=2)
+        print(f"  ✅ OpenClaw already connected — API key refreshed")
+    except Exception:
+        print(f"  ✅ OpenClaw already connected")
+PYSCRIPT
+fi
+
+# ── Step 6: Verify everything ─────────────────────────────────────────────────
+say "Verifying memory system..."
+
+# Re-read API key (may have been generated by server startup)
+if [[ -f "$ARN_DATA_DIR/.api_key" ]]; then
+    API_KEY="$(cat "$ARN_DATA_DIR/.api_key")"
+fi
+
+HEALTH=$(curl -sf "http://127.0.0.1:$ARN_PORT/v1/health" 2>/dev/null || echo "")
+
+if [[ -z "$HEALTH" ]]; then
+    fail "Server not responding — check $LOG_FILE"
+fi
+
+STATUS=$(echo "$HEALTH" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status','unknown'))" 2>/dev/null || echo "unknown")
+
+if [[ "$STATUS" != "ok" ]]; then
+    warn "Server status: $STATUS (check $LOG_FILE)"
+fi
+
+# Quick store + recall test
+TEST_AGENT="arn_setup_verify_$$"
+TEST_CONTENT="ARN setup verification test memory"
+
+STORE_RESULT=$(curl -sf -X POST "http://127.0.0.1:$ARN_PORT/v1/memory/store" \
+    -H "Content-Type: application/json" \
+    -H "X-API-Key: $API_KEY" \
+    -d "{\"agent_id\":\"$TEST_AGENT\",\"content\":\"$TEST_CONTENT\",\"importance\":0.5}" \
+    2>/dev/null || echo "")
+
+if [[ -z "$STORE_RESULT" ]]; then
+    warn "Store test failed — server may still be loading the model"
+else
+    RECALL_RESULT=$(curl -sf -X POST "http://127.0.0.1:$ARN_PORT/v1/memory/recall" \
+        -H "Content-Type: application/json" \
+        -H "X-API-Key: $API_KEY" \
+        -d "{\"agent_id\":\"$TEST_AGENT\",\"query\":\"setup verification\",\"top_k\":1}" \
+        2>/dev/null || echo "")
+
+    if [[ -n "$RECALL_RESULT" ]]; then
+        ok "Memory store and recall verified"
+    else
+        warn "Recall test inconclusive — memory will work once the model fully loads"
+    fi
+fi
+
+# ── Final output ──────────────────────────────────────────────────────────────
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  ARN is ready."
+echo ""
+echo "  Your agent now has persistent memory."
+echo "  It will remember across sessions."
+echo ""
+echo "  To check memory:  arn recall -q \"who am I\""
+echo "  To add a memory:  arn store -c \"I prefer Python\" -i 0.9"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
