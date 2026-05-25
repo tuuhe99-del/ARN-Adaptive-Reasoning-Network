@@ -2,7 +2,7 @@
 
 Brain-inspired persistent memory for AI agents. Runs locally, costs $0/month, fits in under 50MB on a Raspberry Pi 5.
 
-Hi, I'm Mohamed. I'm a student at Columbus State Community College studying IT, and I built this because I wanted my AI agents to actually remember things between sessions without paying for a cloud service. It started as a side project on my Pi 5 and turned into something I think is worth sharing.
+Hi, I'm Mohamed. I built this because I wanted my AI agents to actually remember things between sessions without paying for a cloud service. It started as a side project on my Pi 5 and turned into something I think is worth sharing.
 
 If you're building agents with OpenClaw, LangChain, or any framework where you keep re-explaining context to your agent every session, this might help.
 
@@ -172,7 +172,7 @@ I'm being upfront about this because I want people to build on it, not waste tim
 - **No multi-modal support** — text only. Adding image/audio embeddings is doable but not started.
 - **Embedding model picks aren't great for non-English** — the defaults are English-tuned. Multilingual support would need a different model like `paraphrase-multilingual-MiniLM-L12-v2`.
 - **Tests have `@requires_embeddings` skips** — if you run without sentence-transformers installed, 7 of 40 tests skip. That's correct behavior but means the CI matrix needs both modes.
-- **I'm not a seasoned ML engineer** — I'm a student. Some of the scoring weights, similarity thresholds, and consolidation parameters are empirically tuned but probably not optimal. If you have a better intuition for these, PRs welcome.
+- **Scoring weights are empirically tuned** — the similarity thresholds and consolidation parameters work well in testing but are not theoretically optimal. If you have a better intuition for these, PRs welcome.
 
 ## Things I think would be valuable next
 
@@ -197,13 +197,13 @@ If you fit the free tier, just use it. Keep the LICENSE file in your fork and yo
 
 If your company is over the threshold and you want to use this in a product, open an issue titled "Commercial licensing inquiry" or reach me through my GitHub profile. See [COMMERCIAL.md](./COMMERCIAL.md) for details.
 
-I picked this instead of MIT because I'm a student and this project took a lot of work. If it's useful to you personally, I want you to have it free. If a corporation is making money off it, I'd like a share of that. The PolyForm license is written by actual lawyers and is used by other projects for this same reason.
+I picked this instead of MIT because this project took a lot of work. If it's useful to you personally, I want you to have it free. If a corporation is making money off it, I'd like a share of that. The PolyForm license is written by actual lawyers and is used by other projects for this same reason.
 
 ## About
 
-My name is Mohamed Mohamed. I'm an IT student at Columbus State Community College (currently on academic probation, not gonna hide that). I built this on a Raspberry Pi 5 I recovered from a corrupted SD card, using OpenClaw as my agent framework.
+My name is Mohamed Mohamed (MrKali). I built this on a Raspberry Pi 5 I recovered from a corrupted SD card, using OpenClaw as my agent framework.
 
-If you want to reach out, open an issue or reach me through the contacts in my GitHub profile. I'm not claiming this is production-grade enterprise software — I'm a student who built something that works and passes real adversarial tests. If you find bugs or have ideas, please say so.
+If you want to reach out, open an issue or reach me through the contacts in my GitHub profile. If you find bugs or have ideas, please say so.
 
 Thanks for looking at this.
 
