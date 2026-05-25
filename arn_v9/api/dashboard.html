@@ -1,0 +1,1095 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ARN Dashboard</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f7f8fa;
+      --panel: #ffffff;
+      --line: #d7dce2;
+      --text: #1b1f24;
+      --muted: #66707c;
+      --accent: #1769aa;
+      --accent-dark: #0f4d7d;
+      --error: #b42318;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 14px;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 16px 24px;
+      border-bottom: 1px solid var(--line);
+      background: var(--panel);
+    }
+    h1 { margin: 0; font-size: 20px; font-weight: 650; }
+    h2 { margin: 0 0 12px; font-size: 15px; font-weight: 650; }
+    label { display: block; margin-bottom: 6px; color: var(--muted); font-size: 12px; }
+    input, select, button, textarea {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 9px 10px;
+      font: inherit;
+      background: #fff;
+      color: var(--text);
+    }
+    textarea { min-height: 70px; resize: vertical; }
+    button {
+      cursor: pointer;
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+      font-weight: 600;
+    }
+    button:hover { background: var(--accent-dark); }
+    button.secondary {
+      background: #fff;
+      color: var(--accent);
+      border-color: #9bbbd5;
+    }
+    main {
+      display: grid;
+      grid-template-columns: minmax(360px, 1.2fr) minmax(320px, 0.8fr);
+      gap: 16px;
+      padding: 16px 24px 24px;
+    }
+    .toolbar {
+      display: grid;
+      grid-template-columns: 1fr 130px 130px 100px;
+      gap: 10px;
+      align-items: end;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+    }
+    .stack { display: grid; gap: 16px; }
+    .row { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: end; }
+    .status { margin-top: 10px; min-height: 20px; color: var(--muted); }
+    .status.error { color: var(--error); }
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+    }
+    .stat {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 9px;
+      background: #fbfcfd;
+    }
+    .stat b { display: block; font-size: 18px; margin-bottom: 2px; }
+    .stat span { color: var(--muted); font-size: 12px; }
+    .memory-list { display: grid; gap: 8px; margin-top: 12px; }
+    .memory {
+      text-align: left;
+      display: grid;
+      gap: 5px;
+      width: 100%;
+      background: #fff;
+      color: var(--text);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 10px;
+      cursor: pointer;
+    }
+    .memory:hover, .memory.selected { border-color: var(--accent); background: #f2f8fd; }
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 12px;
+      align-items: center;
+    }
+    .source-badge {
+      display: inline-block;
+      padding: 1px 6px;
+      border-radius: 4px;
+      font-size: 10px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.3px;
+      color: #fff;
+    }
+    .source-badge.source-user { background: #2563eb; }
+    .source-badge.source-agent { background: #16a34a; }
+    .source-badge.source-tool { background: #ea580c; }
+    .source-badge.source-compaction { background: #6b7280; }
+    .source-badge.source-tool_result { background: #d97706; }
+    .source-badge.source-unknown { background: #9ca3af; }
+    .trash-btn {
+      margin-left: auto;
+      padding: 2px 8px;
+      font-size: 12px;
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      color: var(--error);
+      cursor: pointer;
+    }
+    .trash-btn:hover { background: #fef2f2; border-color: var(--error); }
+    .content { line-height: 1.4; overflow-wrap: anywhere; }
+    .detail { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.45; }
+    .muted { color: var(--muted); }
+    .result {
+      border-top: 1px solid var(--line);
+      padding: 10px 0;
+    }
+    .result:first-child { border-top: 0; padding-top: 0; }
+    .tabs { display: flex; gap: 6px; }
+    .tab-btn {
+      width: auto;
+      padding: 7px 18px;
+      font-size: 13px;
+      background: #fff;
+      color: var(--muted);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      font-weight: 500;
+    }
+    .tab-btn.active {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+    #relationsView { display: none; }
+    .rel-toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      padding: 14px 24px 0;
+    }
+    .rel-toolbar button, .rel-toolbar select { width: auto; }
+    .rel-toolbar select { padding: 8px 10px; }
+    .rel-status { color: var(--muted); font-size: 12px; min-height: 18px; flex: 1; }
+    .rel-status.error { color: var(--error); }
+    .relations-main {
+      display: grid;
+      grid-template-columns: 1fr 310px;
+      gap: 16px;
+      padding: 14px 24px 24px;
+    }
+    .node-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(175px, 1fr));
+      gap: 10px;
+      align-content: start;
+      max-height: 75vh;
+      overflow-y: auto;
+      padding: 4px;
+    }
+    .node-card {
+      text-align: left;
+      background: #fff;
+      border: 2px solid var(--line);
+      border-radius: 8px;
+      padding: 10px;
+      cursor: pointer;
+      display: grid;
+      gap: 3px;
+    }
+    .node-card:hover { border-color: var(--accent); }
+    .node-card.src-node { border-color: #d97706; background: #fffbeb; }
+    .node-card.linked-node { border-color: var(--accent); background: #f2f8fd; }
+    .node-type { font-size: 10px; font-weight: 700; text-transform: uppercase; color: var(--muted); letter-spacing: .5px; }
+    .node-id { font-size: 11px; color: var(--muted); }
+    .node-content { font-size: 12px; line-height: 1.35; overflow-wrap: anywhere; color: var(--text); }
+    .neuron-graph {
+      position: relative;
+      width: 100%;
+      height: calc(100vh - 120px);
+      overflow: hidden;
+      background: var(--bg);
+    }
+    .neuron-svg {
+      width: 100%;
+      height: 100%;
+      cursor: grab;
+    }
+    .neuron-svg:active { cursor: grabbing; }
+    .neuron-node { cursor: pointer; }
+    .neuron-node circle {
+      stroke: var(--line);
+      stroke-width: 1.5;
+      fill: #fff;
+    }
+    .neuron-node:hover circle { stroke: var(--accent); stroke-width: 2.5; }
+    .neuron-node.selected circle {
+      filter: drop-shadow(0 0 6px var(--accent));
+      stroke: var(--accent);
+      fill: #f2f8fd;
+    }
+    .neuron-node text { pointer-events: none; }
+    .neuron-edge {
+      fill: none;
+      stroke-width: 1.5;
+      transition: stroke-width 0.15s;
+    }
+    .neuron-edge:hover { stroke-width: 3; }
+    .neuron-edge-label {
+      font-size: 10px;
+      fill: var(--muted);
+      pointer-events: none;
+    }
+    .neuron-edge-del {
+      font-size: 11px;
+      fill: var(--error);
+      cursor: pointer;
+      font-weight: 700;
+    }
+    .edge-relates_to { stroke: #66707c; }
+    .edge-used_by { stroke: #1769aa; }
+    .edge-part_of { stroke: #7c3aed; }
+    .edge-leads_to { stroke: #059669; }
+    .edge-contradicts { stroke: #b42318; }
+    .connect-preview { stroke: #d97706; stroke-dasharray: 5,5; stroke-width: 1.5; pointer-events: none; }
+    .rel-panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+      display: grid;
+      gap: 12px;
+      align-content: start;
+      overflow: hidden;
+    }
+    #neighborSvg { width: 100%; display: block; }
+    .link-item {
+      display: flex;
+      gap: 6px;
+      align-items: baseline;
+      border-top: 1px solid var(--line);
+      padding: 7px 0;
+      font-size: 12px;
+      flex-wrap: wrap;
+    }
+    .link-item:first-child { border-top: 0; }
+    .link-dir { font-weight: 700; color: var(--accent); }
+    .link-type { color: var(--muted); font-size: 11px; white-space: nowrap; }
+    .link-target { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+    .link-del {
+      width: auto;
+      padding: 2px 6px;
+      background: #fff;
+      border-color: var(--line);
+      color: var(--error);
+      font-size: 11px;
+      font-weight: 400;
+      min-width: 0;
+      flex-shrink: 0;
+    }
+    @media (max-width: 900px) {
+      header, main { padding-left: 12px; padding-right: 12px; }
+      main, .toolbar { grid-template-columns: 1fr; }
+      .relations-main { grid-template-columns: 1fr; }
+      .rel-toolbar { padding-left: 12px; padding-right: 12px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>ARN Dashboard</h1>
+    <nav class="tabs">
+      <button class="tab-btn active" onclick="switchTab('memories')">Memories</button>
+      <button class="tab-btn" onclick="switchTab('relations')">Relations</button>
+    </nav>
+  </header>
+  <div id="memoriesView">
+  <main>
+    <section class="stack">
+      <div class="panel">
+        <div class="toolbar">
+          <div>
+            <label for="agentId">Agent ID</label>
+            <input id="agentId" value="default" autocomplete="off">
+          </div>
+          <div>
+            <label for="typeFilter">Type</label>
+            <select id="typeFilter">
+              <option value="">All</option>
+              <option value="episode">episode</option>
+              <option value="identity">identity</option>
+              <option value="preference">preference</option>
+              <option value="procedure">procedure</option>
+              <option value="error">error</option>
+              <option value="fact">fact</option>
+            </select>
+          </div>
+          <div>
+            <label for="sourceFilter">Source</label>
+            <input id="sourceFilter" placeholder="any">
+          </div>
+          <button id="loadBtn">Load</button>
+        </div>
+        <div id="listStatus" class="status">Ready.</div>
+        <div id="memoryList" class="memory-list"></div>
+      </div>
+      <div class="panel">
+        <h2>Search / Recall</h2>
+        <div class="row">
+          <div>
+            <label for="query">Query</label>
+            <textarea id="query" placeholder="Search memories"></textarea>
+          </div>
+          <button id="searchBtn">Search</button>
+        </div>
+        <div id="searchStatus" class="status"></div>
+        <div id="results"></div>
+      </div>
+    </section>
+    <aside class="stack">
+      <div class="panel">
+        <h2>Stats</h2>
+        <div id="stats" class="stats"></div>
+        <div id="statsStatus" class="status"></div>
+      </div>
+      <div class="panel">
+        <h2>Memory Detail</h2>
+        <div id="detail" class="detail muted">Select a memory.</div>
+      </div>
+      <div class="panel">
+        <h2>Related Memories</h2>
+        <button id="relatedBtn" class="secondary">Find Related</button>
+        <div id="relatedStatus" class="status"></div>
+        <div id="related"></div>
+      </div>
+    </aside>
+  </main>
+  </div>
+
+  <div id="relationsView">
+    <div class="rel-toolbar">
+      <button id="relLoadBtn">Load Nodes</button>
+      <button id="connectToggle">Connect: OFF</button>
+      <select id="relType">
+        <option value="relates_to">relates_to</option>
+        <option value="used_by">used_by</option>
+        <option value="part_of">part_of</option>
+        <option value="leads_to">leads_to</option>
+        <option value="contradicts">contradicts</option>
+      </select>
+      <span id="relStatus" class="rel-status">Load nodes to begin.</span>
+    </div>
+    <div id="relNeuronGraph" class="neuron-graph" style="display:none;">
+      <svg id="neuronSvg" class="neuron-svg"></svg>
+    </div>
+    <div id="relCardGrid" style="display:none;">
+      <div class="relations-main">
+        <div id="nodeGrid" class="node-grid" style="position:relative;">
+          <div class="muted">Click &ldquo;Load Nodes&rdquo; to begin.</div>
+          <svg id="cardOverlaySvg" style="position:absolute; top:0; left:0; width:100%; height:100%; pointer-events:none; z-index:5;"></svg>
+        </div>
+        <div class="rel-panel">
+          <h2 style="margin:0">Connections</h2>
+          <svg id="neighborSvg" height="0"></svg>
+          <div id="connectionsDetail"><div class="muted">Select a node.</div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const ARN_GRAPH_MODE = "{{ graph_mode }}";
+    const state = { memories: [], selectedId: null };
+    const $ = (id) => document.getElementById(id);
+
+    function agentId() {
+      return $("agentId").value.trim() || "default";
+    }
+
+    function setStatus(id, text, isError = false) {
+      const el = $(id);
+      el.textContent = text || "";
+      el.className = "status" + (isError ? " error" : "");
+    }
+
+    function fmtTime(value) {
+      if (!value) return "unknown time";
+      const date = new Date(value * 1000);
+      return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
+    }
+
+    function short(text, max = 180) {
+      text = text || "";
+      return text.length > max ? text.slice(0, max - 1) + "..." : text;
+    }
+
+    async function api(path, options = {}) {
+      const response = await fetch(path, {
+        ...options,
+        headers: {"Content-Type": "application/json", ...(options.headers || {})}
+      });
+      const text = await response.text();
+      const data = text ? JSON.parse(text) : {};
+      if (!response.ok) {
+        throw new Error(data.detail || response.statusText || "Request failed");
+      }
+      return data;
+    }
+
+    async function loadMemories() {
+      setStatus("listStatus", "Loading memories...");
+      const type = $("typeFilter").value;
+      const body = {agent_id: agentId(), limit: 200};
+      if (type) body.memory_type = type;
+      try {
+        const data = await api("/v1/memory/list", {method: "POST", body: JSON.stringify(body)});
+        state.memories = data.memories || [];
+        renderMemories();
+        setStatus("listStatus", `${state.memories.length} memories loaded.`);
+      } catch (err) {
+        state.memories = [];
+        renderMemories();
+        setStatus("listStatus", err.message, true);
+      }
+    }
+
+    async function loadStats() {
+      setStatus("statsStatus", "Loading stats...");
+      try {
+        const data = await api(`/v1/memory/stats/${encodeURIComponent(agentId())}`);
+        $("stats").innerHTML = [
+          stat(data.total_experiences, "lifetime stores"),
+          stat(data.episodic_count, "episodic"),
+          stat(data.semantic_count, "semantic"),
+          stat(data.working_memory_active, "working"),
+          stat(data.storage_mb, "MB stored"),
+          stat(data.cache_hit_rate, "cache hit")
+        ].join("");
+        setStatus("statsStatus", "");
+      } catch (err) {
+        $("stats").innerHTML = "";
+        setStatus("statsStatus", err.message, true);
+      }
+    }
+
+    function stat(value, label) {
+      return `<div class="stat"><b>${escapeHtml(String(value ?? "-"))}</b><span>${escapeHtml(label)}</span></div>`;
+    }
+
+    function filteredMemories() {
+      const source = $("sourceFilter").value.trim().toLowerCase();
+      if (!source) return state.memories;
+      return state.memories.filter((m) => String(m.source || "").toLowerCase().includes(source));
+    }
+
+    function sourceBadgeClass(source) {
+      const s = String(source || "unknown").toLowerCase();
+      if (s.startsWith("tool:")) return "source-tool";
+      if (s === "tool_result") return "source-tool_result";
+      return "source-" + s;
+    }
+
+    function renderMemories() {
+      const rows = filteredMemories();
+      $("memoryList").innerHTML = rows.map((m) => `
+        <div class="memory ${m.id === state.selectedId ? "selected" : ""}" data-id="${m.id}" role="button" tabindex="0">
+          <div class="meta">
+            <span>#${escapeHtml(String(m.id))}</span>
+            <span>${escapeHtml(m.memory_type || "episode")}</span>
+            <span class="source-badge ${sourceBadgeClass(m.source)}">${escapeHtml(m.source || "unknown")}</span>
+            <span>importance ${escapeHtml(String(m.importance ?? "-"))}</span>
+            <span>${escapeHtml(fmtTime(m.created_at))}</span>
+            <button class="trash-btn" data-trash-id="${m.id}" title="Delete memory">🗑</button>
+          </div>
+          <div class="content">${escapeHtml(short(m.content))}</div>
+        </div>
+      `).join("") || `<div class="muted">No memories found.</div>`;
+      document.querySelectorAll(".memory").forEach((el) => {
+        el.addEventListener("click", () => selectMemory(Number(el.dataset.id)));
+        el.addEventListener("keydown", (e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            selectMemory(Number(el.dataset.id));
+          }
+        });
+      });
+      document.querySelectorAll(".trash-btn").forEach((btn) => {
+        btn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          deleteMemory(Number(btn.dataset.trashId));
+        });
+      });
+    }
+
+    async function deleteMemory(id) {
+      if (!confirm("Delete memory #" + id + "?")) return;
+      try {
+        await api("/v1/memory/delete", {
+          method: "POST",
+          body: JSON.stringify({agent_id: agentId(), episode_id: id})
+        });
+        state.selectedId = null;
+        $("detail").textContent = "";
+        loadMemories();
+        loadStats();
+      } catch (err) {
+        alert("Delete failed: " + err.message);
+      }
+    }
+
+    function selectMemory(id) {
+      state.selectedId = id;
+      const memory = state.memories.find((m) => m.id === id);
+      renderMemories();
+      if (!memory) return;
+      $("detail").className = "detail";
+      $("detail").textContent = [
+        `ID: ${memory.id}`,
+        `Type: ${memory.memory_type || "episode"}`,
+        `Source: ${memory.source || "unknown"}`,
+        `Importance: ${memory.importance ?? "-"}`,
+        `Created: ${fmtTime(memory.created_at)}`,
+        `Access count: ${memory.access_count ?? 0}`,
+        "",
+        memory.content || ""
+      ].join("\\n");
+    }
+
+    async function recall(targetId, statusId, queryText) {
+      setStatus(statusId, "Searching...");
+      try {
+        const data = await api("/v1/memory/recall", {
+          method: "POST",
+          body: JSON.stringify({agent_id: agentId(), query: queryText, top_k: 8})
+        });
+        $(targetId).innerHTML = renderResults(data.results || []);
+        setStatus(statusId, `${(data.results || []).length} results in ${data.latency_ms} ms.`);
+      } catch (err) {
+        $(targetId).innerHTML = "";
+        setStatus(statusId, err.message, true);
+      }
+    }
+
+    function renderResults(results) {
+      return results.map((r) => `
+        <div class="result">
+          <div class="meta">
+            <span>${escapeHtml(r.type || "memory")}</span>
+            <span>${escapeHtml(r.memory_type || "episode")}</span>
+            <span>${escapeHtml(r.source || "unknown")}</span>
+            <span>score ${escapeHtml(String(r.score ?? "-"))}</span>
+          </div>
+          <div class="content">${escapeHtml(short(r.content, 260))}</div>
+        </div>
+      `).join("") || `<div class="muted">No results.</div>`;
+    }
+
+    function escapeHtml(value) {
+      return value.replace(/[&<>"']/g, (ch) => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", "\\\"": "&quot;", "'": "&#39;"
+      }[ch]));
+    }
+
+    $("loadBtn").addEventListener("click", () => { loadMemories(); loadStats(); });
+    $("searchBtn").addEventListener("click", () => {
+      const query = $("query").value.trim();
+      if (!query) return setStatus("searchStatus", "Enter a query.", true);
+      recall("results", "searchStatus", query);
+    });
+    $("relatedBtn").addEventListener("click", () => {
+      const memory = state.memories.find((m) => m.id === state.selectedId);
+      if (!memory) return setStatus("relatedStatus", "Select a memory first.", true);
+      recall("related", "relatedStatus", memory.content);
+    });
+    $("sourceFilter").addEventListener("input", renderMemories);
+    loadMemories();
+    loadStats();
+
+    // ---- TAB SWITCHING ----
+    function switchTab(name) {
+      $("memoriesView").style.display = name === "memories" ? "block" : "none";
+      $("relationsView").style.display = name === "relations" ? "block" : "none";
+      document.querySelectorAll(".tab-btn").forEach(function(btn, i) {
+        btn.classList.toggle("active", (i === 0) === (name === "memories"));
+      });
+      if (name === "relations") {
+        $("relNeuronGraph").style.display = ARN_GRAPH_MODE === "full" ? "block" : "none";
+        $("relCardGrid").style.display = ARN_GRAPH_MODE === "full" ? "none" : "block";
+        loadRelNodes();
+      }
+    }
+
+    // ---- RELATIONS STATE ----
+    var rel = {
+      memories: [],
+      links: [],
+      allLinks: [],
+      selectedId: null,
+      connectMode: false,
+      sourceId: null,
+    };
+
+    function setRelStatus(msg, isError) {
+      var el = $("relStatus");
+      el.textContent = msg || "";
+      el.className = "rel-status" + (isError ? " error" : "");
+    }
+
+    function relPosKey(id) {
+      return "arn_rel_pos_" + agentId() + "_" + id;
+    }
+
+    function getRelPos(id, defaultX, defaultY) {
+      try {
+        var raw = localStorage.getItem(relPosKey(id));
+        if (raw) {
+          var p = JSON.parse(raw);
+          return { x: p.x, y: p.y };
+        }
+      } catch (e) {}
+      return { x: defaultX, y: defaultY };
+    }
+
+    function setRelPos(id, x, y) {
+      try {
+        localStorage.setItem(relPosKey(id), JSON.stringify({ x: x, y: y }));
+      } catch (e) {}
+    }
+
+    async function loadRelNodes() {
+      setRelStatus("Loading...");
+      var body = { agent_id: agentId(), limit: 200 };
+      try {
+        var data = await api("/v1/memory/list", { method: "POST", body: JSON.stringify(body) });
+        rel.memories = data.memories || [];
+        await loadAllLinks();
+        rel.links = [];
+        if (ARN_GRAPH_MODE === "full") {
+          renderNeuronGraph();
+        } else {
+          renderNodeGrid();
+          renderCardOverlay();
+        }
+        setRelStatus(rel.memories.length + " nodes loaded.");
+        if (rel.selectedId !== null) loadLinksForNode(rel.selectedId);
+      } catch (err) {
+        setRelStatus(err.message, true);
+      }
+    }
+
+    async function loadAllLinks() {
+      try {
+        var data = await api("/v1/memory/links", {
+          method: "POST",
+          body: JSON.stringify({ agent_id: agentId() }),
+        });
+        rel.allLinks = data.links || [];
+      } catch (err) {
+        rel.allLinks = [];
+      }
+    }
+
+    async function loadLinksForNode(episodeId) {
+      if (ARN_GRAPH_MODE === "full") {
+        rel.selectedId = episodeId;
+        highlightNeuronNode(episodeId);
+        return;
+      }
+      try {
+        var data = await api("/v1/memory/links", {
+          method: "POST",
+          body: JSON.stringify({ agent_id: agentId(), episode_id: episodeId }),
+        });
+        rel.links = data.links || [];
+        renderConnections();
+        renderNeighborSvg(rel.links);
+      } catch (err) {
+        $("connectionsDetail").innerHTML = '<div class="muted">Error loading connections.</div>';
+      }
+    }
+
+    // ---- VERSION A: FULL SVG NEURON GRAPH ----
+    var neuron = {
+      dragging: null,
+      panning: false,
+      panStart: { x: 0, y: 0 },
+      previewLine: null,
+    };
+
+    function edgeColorClass(type) {
+      return "edge-" + (type || "relates_to");
+    }
+
+    function renderNeuronGraph() {
+      var svg = $("neuronSvg");
+      var W = svg.clientWidth || 800;
+      var H = svg.clientHeight || 600;
+      if (!rel.memories.length) {
+        svg.innerHTML = '<text x="50%" y="50%" text-anchor="middle" fill="var(--muted)" font-size="14">No nodes loaded.</text>';
+        return;
+      }
+      var cols = Math.max(1, Math.floor(Math.sqrt(rel.memories.length)));
+      var rows = Math.ceil(rel.memories.length / cols);
+      var spacingX = W / (cols + 1);
+      var spacingY = H / (rows + 1);
+      rel.memories.forEach(function(m, i) {
+        if (m._x === undefined) {
+          var defaultX = spacingX * (1 + (i % cols));
+          var defaultY = spacingY * (1 + Math.floor(i / cols));
+          var pos = getRelPos(m.id, defaultX, defaultY);
+          m._x = pos.x;
+          m._y = pos.y;
+        }
+      });
+      drawNeuronSvg(svg, W, H);
+    }
+
+    function drawNeuronSvg(svg, W, H) {
+      var s = '<defs><filter id="glow"><feGaussianBlur stdDeviation="2.5" result="coloredBlur"/><feMerge><feMergeNode in="coloredBlur"/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs>';
+      rel.allLinks.forEach(function(l) {
+        var from = rel.memories.find(function(m) { return m.id === l.from_episode_id; });
+        var to = rel.memories.find(function(m) { return m.id === l.to_episode_id; });
+        if (!from || !to || from._x === undefined || to._x === undefined) return;
+        var mx = (from._x + to._x) / 2, my = (from._y + to._y) / 2;
+        var qx = mx + (to._y - from._y) * 0.2;
+        var qy = my - (to._x - from._x) * 0.2;
+        s += '<path d="M' + from._x + ',' + from._y + ' Q' + qx + ',' + qy + ' ' + to._x + ',' + to._y + '"';
+        s += ' class="neuron-edge ' + edgeColorClass(l.relation_type) + '"/>';
+        s += '<text x="' + qx + '" y="' + (qy - 4) + '" text-anchor="middle" class="neuron-edge-label">' + escapeHtml(l.relation_type) + '</text>';
+        s += '<text x="' + qx + '" y="' + (qy + 8) + '" text-anchor="middle" class="neuron-edge-del" data-lid="' + l.id + '">&#x2715;</text>';
+      });
+      if (neuron.previewLine) {
+        s += '<line x1="' + neuron.previewLine.x1 + '" y1="' + neuron.previewLine.y1 + '" x2="' + neuron.previewLine.x2 + '" y2="' + neuron.previewLine.y2 + '" class="connect-preview"/>';
+      }
+      rel.memories.forEach(function(m) {
+        var isSel = rel.selectedId === m.id;
+        var isSrc = rel.connectMode && rel.sourceId === m.id;
+        var r = isSrc ? 28 : 26;
+        var fill = isSel ? "#f2f8fd" : (isSrc ? "#fffbeb" : "#fff");
+        var stroke = isSrc ? "#d97706" : (isSel ? "var(--accent)" : "var(--line)");
+        var cls = "neuron-node" + (isSel || isSrc ? " selected" : "");
+        s += '<g class="' + cls + '" data-id="' + m.id + '" transform="translate(' + m._x + ',' + m._y + ')">';
+        s += '<circle r="' + r + '" fill="' + fill + '" stroke="' + stroke + '"/>';
+        s += '<text y="-6" text-anchor="middle" fill="var(--muted)" font-size="9" font-weight="700">' + escapeHtml((m.memory_type || "episode").toUpperCase()) + '</text>';
+        s += '<text y="4" text-anchor="middle" fill="var(--text)" font-size="10">#' + escapeHtml(String(m.id)) + '</text>';
+        s += '<text y="14" text-anchor="middle" fill="var(--text)" font-size="9">' + escapeHtml(short(m.content, 22)) + '</text>';
+        s += '</g>';
+      });
+      svg.innerHTML = s;
+      svg.querySelectorAll(".neuron-node").forEach(function(g) {
+        g.addEventListener("mousedown", function(e) {
+          e.stopPropagation();
+          var id = Number(g.dataset.id);
+          if (rel.connectMode) {
+            handleNodeClick(id);
+            return;
+          }
+          var m = rel.memories.find(function(mem) { return mem.id === id; });
+          if (m) {
+            neuron.dragging = { id: id, startX: e.clientX, startY: e.clientY, origX: m._x, origY: m._y };
+          }
+        });
+      });
+      svg.querySelectorAll(".neuron-edge-del").forEach(function(t) {
+        t.addEventListener("click", function(e) {
+          e.stopPropagation();
+          doDeleteLink(Number(t.dataset.lid));
+        });
+      });
+    }
+
+    function highlightNeuronNode(episodeId) {
+      var svg = $("neuronSvg");
+      drawNeuronSvg(svg, svg.clientWidth || 800, svg.clientHeight || 600);
+    }
+
+    // ---- VERSION B: CARD GRID + OVERLAY ----
+    function nodeClass(id) {
+      if (rel.connectMode && rel.sourceId === id) return " src-node";
+      if (!rel.connectMode && rel.selectedId === id) return " linked-node";
+      return "";
+    }
+
+    function renderNodeGrid() {
+      var grid = $("nodeGrid");
+      var overlay = $("cardOverlaySvg");
+      if (!rel.memories.length) {
+        grid.innerHTML = '<div class="muted">No nodes loaded.</div>';
+        if (overlay) overlay.style.display = "none";
+        return;
+      }
+      grid.innerHTML = rel.memories.map(function(m) {
+        return '<button class="node-card' + nodeClass(m.id) + '" data-id="' + m.id + '">' +
+          '<div class="node-type">' + escapeHtml(m.memory_type || "episode") + '</div>' +
+          '<div class="node-id">#' + escapeHtml(String(m.id)) + '</div>' +
+          '<div class="node-content">' + escapeHtml(short(m.content, 80)) + '</div>' +
+          '</button>';
+      }).join("");
+      if (overlay) {
+        grid.appendChild(overlay);
+        overlay.style.display = "block";
+      }
+      document.querySelectorAll(".node-card").forEach(function(el) {
+        el.addEventListener("click", function() { handleNodeClick(Number(el.dataset.id)); });
+      });
+      requestAnimationFrame(renderCardOverlay);
+    }
+
+    function renderCardOverlay() {
+      var svg = $("cardOverlaySvg");
+      var grid = $("nodeGrid");
+      if (!rel.memories.length || !grid || !svg) return;
+      var gridRect = grid.getBoundingClientRect();
+      svg.setAttribute("width", grid.scrollWidth);
+      svg.setAttribute("height", grid.scrollHeight);
+      var s = "";
+      rel.allLinks.forEach(function(l) {
+        var fromEl = grid.querySelector('[data-id="' + l.from_episode_id + '"]');
+        var toEl = grid.querySelector('[data-id="' + l.to_episode_id + '"]');
+        if (!fromEl || !toEl) return;
+        var fromRect = fromEl.getBoundingClientRect();
+        var toRect = toEl.getBoundingClientRect();
+        var x1 = fromRect.left + fromRect.width / 2 - gridRect.left + grid.scrollLeft;
+        var y1 = fromRect.top + fromRect.height / 2 - gridRect.top + grid.scrollTop;
+        var x2 = toRect.left + toRect.width / 2 - gridRect.left + grid.scrollLeft;
+        var y2 = toRect.top + toRect.height / 2 - gridRect.top + grid.scrollTop;
+        s += '<line x1="' + x1 + '" y1="' + y1 + '" x2="' + x2 + '" y2="' + y2 + '" stroke="#d7dce2" stroke-width="1.5"/>';
+        var mx = (x1 + x2) / 2, my = (y1 + y2) / 2;
+        s += '<text x="' + mx + '" y="' + (my - 3) + '" text-anchor="middle" fill="var(--muted)" font-size="9">' + escapeHtml(l.relation_type) + '</text>';
+      });
+      svg.innerHTML = s;
+    }
+
+    // ---- SHARED HANDLERS ----
+    function handleNodeClick(id) {
+      if (rel.connectMode) {
+        if (rel.sourceId === null) {
+          rel.sourceId = id;
+          setRelStatus("Source: #" + id + ". Click the target node.");
+          if (ARN_GRAPH_MODE === "full") renderNeuronGraph();
+          else renderNodeGrid();
+        } else if (rel.sourceId !== id) {
+          var fromId = rel.sourceId;
+          rel.sourceId = null;
+          if (ARN_GRAPH_MODE === "full") renderNeuronGraph();
+          else renderNodeGrid();
+          doCreateLink(fromId, id);
+        } else {
+          rel.sourceId = null;
+          setRelStatus("Source cleared. Click a node to start again.");
+          if (ARN_GRAPH_MODE === "full") renderNeuronGraph();
+          else renderNodeGrid();
+        }
+      } else {
+        rel.selectedId = id;
+        if (ARN_GRAPH_MODE === "full") loadLinksForNode(id);
+        else loadLinksForNode(id);
+      }
+    }
+
+    async function doCreateLink(fromId, toId) {
+      var relType = $("relType").value;
+      setRelStatus("Saving link...");
+      try {
+        await api("/v1/memory/link", {
+          method: "POST",
+          body: JSON.stringify({
+            agent_id: agentId(),
+            from_episode_id: fromId,
+            to_episode_id: toId,
+            relation_type: relType,
+          }),
+        });
+        setRelStatus("Linked #" + fromId + " → #" + toId + " (" + relType + ")");
+        await loadAllLinks();
+        if (ARN_GRAPH_MODE === "full") {
+          if (rel.selectedId !== null) highlightNeuronNode(rel.selectedId);
+          else renderNeuronGraph();
+        } else {
+          if (rel.selectedId !== null) loadLinksForNode(rel.selectedId);
+          renderCardOverlay();
+        }
+      } catch (err) {
+        setRelStatus("Link error: " + err.message, true);
+      }
+    }
+
+    function renderConnections() {
+      var detail = $("connectionsDetail");
+      if (rel.selectedId === null) {
+        detail.innerHTML = '<div class="muted">Select a node.</div>';
+        renderNeighborSvg([]);
+        return;
+      }
+      renderNeighborSvg(rel.links);
+      if (!rel.links.length) {
+        detail.innerHTML = '<div class="muted">No connections yet.</div>';
+        return;
+      }
+      detail.innerHTML = rel.links.map(function(l) {
+        var out = l.from_episode_id === rel.selectedId;
+        var dir = out ? "→" : "←";
+        var otherId = out ? l.to_episode_id : l.from_episode_id;
+        var other = rel.memories.find(function(m) { return m.id === otherId; });
+        return '<div class="link-item">' +
+          '<span class="link-dir">' + escapeHtml(dir) + '</span>' +
+          '<span class="link-type">' + escapeHtml(l.relation_type) + '</span>' +
+          '<span class="link-target">#' + escapeHtml(String(otherId)) +
+            (other ? ": " + escapeHtml(short(other.content, 40)) : "") + '</span>' +
+          '<button class="link-del" data-lid="' + l.id + '">&#x2715;</button>' +
+          '</div>';
+      }).join("");
+      document.querySelectorAll(".link-del").forEach(function(btn) {
+        btn.addEventListener("click", function() { doDeleteLink(Number(btn.dataset.lid)); });
+      });
+    }
+
+    function renderNeighborSvg(links) {
+      var svg = $("neighborSvg");
+      var W = svg.clientWidth || 280;
+      var H = links.length ? 180 : 0;
+      svg.setAttribute("height", H);
+      if (!links.length) { svg.innerHTML = ""; return; }
+
+      var cx = W / 2, cy = H / 2;
+      var sel = rel.memories.find(function(m) { return m.id === rel.selectedId; });
+      var selLabel = sel ? short(sel.content, 18) : "#" + rel.selectedId;
+
+      var neighbors = links.map(function(l, i) {
+        var out = l.from_episode_id === rel.selectedId;
+        var otherId = out ? l.to_episode_id : l.from_episode_id;
+        var other = rel.memories.find(function(m) { return m.id === otherId; });
+        var angle = (2 * Math.PI * i / links.length) - Math.PI / 2;
+        var r = Math.min(W, H) * 0.36;
+        return {
+          x: cx + r * Math.cos(angle),
+          y: cy + r * Math.sin(angle),
+          id: otherId,
+          label: other ? short(other.content, 12) : "#" + otherId,
+          relType: l.relation_type,
+          out: out,
+        };
+      });
+
+      var s = "";
+      neighbors.forEach(function(n) {
+        s += '<line x1="' + cx + '" y1="' + cy + '" x2="' + n.x + '" y2="' + n.y +
+             '" stroke="var(--line)" stroke-width="1.5"/>';
+        var mx = (cx + n.x) / 2, my = (cy + n.y) / 2;
+        s += '<text x="' + mx + '" y="' + (my - 3) +
+             '" text-anchor="middle" fill="var(--muted)" font-size="9">' +
+             escapeHtml(n.relType) + '</text>';
+      });
+      s += '<circle cx="' + cx + '" cy="' + cy + '" r="22" fill="var(--accent)"/>';
+      s += '<text x="' + cx + '" y="' + (cy + 4) +
+           '" text-anchor="middle" fill="white" font-size="9">' +
+           escapeHtml(selLabel) + '</text>';
+      neighbors.forEach(function(n) {
+        var fill = n.out ? "#e8f0fe" : "#e8f8f0";
+        s += '<circle cx="' + n.x + '" cy="' + n.y + '" r="17" fill="' + fill +
+             '" stroke="var(--line)" stroke-width="1"/>';
+        s += '<text x="' + n.x + '" y="' + (n.y + 4) +
+             '" text-anchor="middle" fill="var(--text)" font-size="9">#' +
+             escapeHtml(String(n.id)) + '</text>';
+      });
+      svg.innerHTML = s;
+    }
+
+    async function doDeleteLink(linkId) {
+      try {
+        await api("/v1/memory/unlink", {
+          method: "POST",
+          body: JSON.stringify({ agent_id: agentId(), link_id: linkId }),
+        });
+        await loadAllLinks();
+        if (ARN_GRAPH_MODE === "full") {
+          if (rel.selectedId !== null) highlightNeuronNode(rel.selectedId);
+          else renderNeuronGraph();
+        } else {
+          if (rel.selectedId !== null) loadLinksForNode(rel.selectedId);
+          renderCardOverlay();
+        }
+      } catch (err) {
+        setRelStatus("Delete error: " + err.message, true);
+      }
+    }
+
+    $("relLoadBtn").addEventListener("click", loadRelNodes);
+    $("connectToggle").addEventListener("click", function() {
+      rel.connectMode = !rel.connectMode;
+      rel.sourceId = null;
+      $("connectToggle").textContent = rel.connectMode ? "Connect: ON" : "Connect: OFF";
+      $("connectToggle").style.background = rel.connectMode ? "#d97706" : "";
+      $("connectToggle").style.borderColor = rel.connectMode ? "#d97706" : "";
+      setRelStatus(rel.connectMode ? "Click source node." : "Connect mode off.");
+      if (ARN_GRAPH_MODE === "full") renderNeuronGraph();
+      else renderNodeGrid();
+    });
+
+    // ---- VERSION A INTERACTIONS ----
+    if (ARN_GRAPH_MODE === "full") {
+      var svgEl = $("neuronSvg");
+      svgEl.addEventListener("mousedown", function(e) {
+        if (e.target === svgEl || e.target.tagName === "svg") {
+          neuron.panning = true;
+          neuron.panStart = { x: e.clientX, y: e.clientY };
+          svgEl.style.cursor = "grabbing";
+        }
+      });
+      window.addEventListener("mousemove", function(e) {
+        if (neuron.dragging) {
+          var dx = e.clientX - neuron.dragging.startX;
+          var dy = e.clientY - neuron.dragging.startY;
+          var m = rel.memories.find(function(mem) { return mem.id === neuron.dragging.id; });
+          if (m) {
+            m._x = neuron.dragging.origX + dx;
+            m._y = neuron.dragging.origY + dy;
+            setRelPos(m.id, m._x, m._y);
+            drawNeuronSvg(svgEl, svgEl.clientWidth || 800, svgEl.clientHeight || 600);
+          }
+        } else if (neuron.panning) {
+          var dx = e.clientX - neuron.panStart.x;
+          var dy = e.clientY - neuron.panStart.y;
+          neuron.panStart = { x: e.clientX, y: e.clientY };
+          rel.memories.forEach(function(m) {
+            m._x = (m._x || 0) + dx;
+            m._y = (m._y || 0) + dy;
+            setRelPos(m.id, m._x, m._y);
+          });
+          drawNeuronSvg(svgEl, svgEl.clientWidth || 800, svgEl.clientHeight || 600);
+        } else if (rel.connectMode && rel.sourceId !== null) {
+          var m = rel.memories.find(function(mem) { return mem.id === rel.sourceId; });
+          if (m) {
+            var rect = svgEl.getBoundingClientRect();
+            neuron.previewLine = { x1: m._x, y1: m._y, x2: e.clientX - rect.left, y2: e.clientY - rect.top };
+            drawNeuronSvg(svgEl, svgEl.clientWidth || 800, svgEl.clientHeight || 600);
+          }
+        }
+      });
+      window.addEventListener("mouseup", function() {
+        if (neuron.dragging) {
+          neuron.dragging = null;
+        }
+        if (neuron.panning) {
+          neuron.panning = false;
+          svgEl.style.cursor = "grab";
+        }
+      });
+    }
+
+    // Resize handler for overlay
+    if (ARN_GRAPH_MODE !== "full") {
+      window.addEventListener("resize", function() {
+        renderCardOverlay();
+      });
+    }
+  </script>
+</body>
+</html>

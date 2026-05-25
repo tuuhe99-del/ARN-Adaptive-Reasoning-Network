@@ -1,0 +1,56 @@
+[build-system]
+requires = []
+build-backend = "arn_build_backend"
+backend-path = ["."]
+
+[project]
+name = "arn-v9"
+version = "0.9.0"
+description = "Adaptive Recall Network — local-first persistent memory for AI agents"
+readme = "README.md"
+license = {file = "LICENSE.md"}
+authors = [
+    {name = "Mohamed Mohamed"}
+]
+keywords = ["ai", "agents", "memory", "embeddings", "cognitive", "neuroscience", "openclaw", "rag"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: Other/Proprietary License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "numpy>=1.26",
+    "sentence-transformers>=2.7",
+    "psutil>=5.9",
+    "httpx>=0.27",
+    "python-telegram-bot[job-queue]>=20.0",
+    "watchdog>=3.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "httpx>=0.27"]
+
+[project.urls]
+Homepage = "https://github.com/MohamedMohamed/arn-v9"
+Issues = "https://github.com/MohamedMohamed/arn-v9/issues"
+
+[project.scripts]
+arn-server = "arn_v9.api.server:main"
+arn-cli = "arn_v9.cli:main"
+arn-collab-runner = "arn_v9.collab_runner:main"
+arn-telegram-bot = "arn_v9.scripts.telegram_bot.main:main"
+
+[tool.setuptools]
+packages = ["arn_v9", "arn_v9.core", "arn_v9.storage", "arn_v9.api", "arn_v9.scripts", "arn_v9.scripts.telegram_bot", "arn_v9.tests", "arn_v9.benchmarks"]
+
+[tool.setuptools.package-data]
+arn_v9 = ["openclaw_skill/SKILL.md", "Dockerfile", "requirements.txt"]

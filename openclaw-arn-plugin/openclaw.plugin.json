@@ -1,0 +1,43 @@
+{
+  "id": "arn-memory",
+  "name": "ARN Semantic Memory",
+  "description": "Auto-store every message and tool call into ARN, auto-inject relevant memories into agent prompts. Replaces markdown memory files.",
+  "version": "1.0.0",
+  "enabledByDefault": false,
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "arnEndpoint": {
+        "type": "string",
+        "default": "http://localhost:8742"
+      },
+      "apiKey": {
+        "type": "string",
+        "default": ""
+      },
+      "topK": {
+        "type": "integer",
+        "default": 5
+      },
+      "minScore": {
+        "type": "number",
+        "default": 0.35
+      },
+      "tokenBudget": {
+        "type": "integer",
+        "default": 1500
+      },
+      "storeMessages": {
+        "type": "boolean",
+        "default": true
+      },
+      "storeCompaction": {
+        "type": "boolean",
+        "default": true
+      }
+    }
+  },
+  "hooks": {
+    "allowPromptInjection": true
+  }
+}
