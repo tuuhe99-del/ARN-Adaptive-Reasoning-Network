@@ -127,21 +127,15 @@ class StorageEngine:
         
         self.embedding_dim = embedding_dim
 
-        # Check model fingerprint now that we have the final embedding_dim.
-        # _data_dir is used inside the fingerprint helpers.
-        self._data_dir = self.data_dir
-        _arn_tier = os.environ.get("ARN_EMBEDDING_TIER", "nano")
-        self._check_model_fingerprint(_arn_tier, self.embedding_dim)
-
         # Initialize database
         self._conn = _ThreadLocalConnection(self.db_path, row_factory=sqlite3.Row)
         self._init_db()
-        
+
         # Initialize vector stores
         self._episodic_vectors: Optional[np.ndarray] = None
         self._semantic_vectors: Optional[np.ndarray] = None
         self._init_vectors()
-        
+
         # Write buffer for batched operations
         self._pending_episode_writes: List[Tuple[int, np.ndarray]] = []
         self._pending_semantic_writes: List[Tuple[int, np.ndarray]] = []
@@ -152,40 +146,11 @@ class StorageEngine:
             from arn_v9.storage.vec_accelerator import VecAccelerator
             self._vec_acc = VecAccelerator(self.data_dir, self.embedding_dim)
             if self._vec_acc.available:
-                # Sync vec0 table from current storage state
                 synced = self._vec_acc.sync_from_storage(self)
                 logger.info(f"[storage] sqlite-vec accelerator ready ({synced} vectors synced)")
         except Exception as _vec_exc:
             logger.debug(f"[storage] sqlite-vec accelerator skipped: {_vec_exc}")
             self._vec_acc = None
-    
-    def _write_model_fingerprint(self, tier: str, dim: int):
-        fp = self._data_dir / ".model_fingerprint"
-        data = {"tier": tier, "dim": dim, "written_at": time.time()}
-        try:
-            fp.write_text(json.dumps(data))
-        except Exception as exc:
-            logger.warning(f"[ARN] Could not write model fingerprint to {fp}: {exc}")
-
-    def _check_model_fingerprint(self, tier: str, dim: int) -> bool:
-        """Returns True if fingerprint matches. Logs warning if same dim but different tier."""
-        fp = self._data_dir / ".model_fingerprint"
-        if not fp.exists():
-            self._write_model_fingerprint(tier, dim)
-            return True
-        try:
-            data = json.loads(fp.read_text())
-            stored_tier = data.get("tier", "unknown")
-            stored_dim = data.get("dim", 0)
-            if stored_dim != dim:
-                logger.warning(f"[ARN] Dim mismatch: stored={stored_dim} current={dim}. Run migration.")
-                return False
-            if stored_tier != tier:
-                logger.warning(f"[ARN] Model tier changed: {stored_tier} → {tier} (same dim={dim}). Vectors may be semantically stale. Re-embed recommended.")
-            return True
-        except Exception:
-            self._write_model_fingerprint(tier, dim)
-            return True
 
     def _get_conn(self) -> sqlite3.Connection:
         return self._conn.get()

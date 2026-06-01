@@ -1,23 +1,13 @@
 """
-ARN v9: Adaptive Reasoning Network - Brain-Inspired Cognitive Architecture
-=============================================================================
+ARN v9: Adaptive Reasoning Network
+====================================
 
-Production implementation combining:
-1. Complementary Learning Systems (fast episodic + slow semantic)
-2. Clustering-based consolidation with contradiction detection
-3. Calibrated prediction error (running statistics baseline)
-4. Domain-specialized columns (repurposed from Thousand Brains)
-5. Semantic embeddings (all-MiniLM-L6-v2, 384-dim)
-6. Persistent storage (SQLite + memmap)
-7. Working memory with decay and rehearsal
-
-Key design decisions:
-- Cortical columns repurposed as DOMAIN PROCESSORS, not spatial grid cells.
-  Text agents don't have spatial reference frames. Each column specializes
-  in a domain (code, conversation, facts, etc.) providing parallel expertise.
-- Consolidation uses similarity-based clustering, not first-word matching.
-- Prediction error is calibrated against running baselines per domain.
-- All vectors are 384-dim normalized (from sentence-transformers).
+Hybrid retrieval memory system:
+- Episodic storage with sqlite-vec (vector KNN) + FTS5 (keyword) + entity matching
+- Reciprocal Rank Fusion across all retrieval signals
+- Bi-temporal facts: valid_from / valid_until with supersedes chains
+- Working memory ring buffer always surfaced at recall top
+- Post-session reflection with user-in-the-loop reconciliation
 """
 
 import numpy as np
@@ -30,109 +20,14 @@ import threading
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional, Any
 from dataclasses import dataclass, field
-from enum import Enum
 from collections import deque
 
 from .embeddings import EmbeddingEngine, EMBEDDING_DIM
 from ..storage.persistence import StorageEngine
-from .contradictions import ContradictionDetector
 
 logger = logging.getLogger("arn.core")
 
 AUTO_LINK_SIMILARITY_THRESHOLD = 0.38
-
-
-# =========================================================
-# DOMAIN COLUMNS (Repurposed Cortical Columns)
-# =========================================================
-
-class DomainType(Enum):
-    """Domain specializations for columns."""
-    CODE = "code"
-    CONVERSATION = "conversation"
-    FACTS = "facts"
-    PROCEDURES = "procedures"
-    PREFERENCES = "preferences"
-    TEMPORAL = "temporal"
-    ERRORS = "errors"
-    GENERAL = "general"
-
-
-@dataclass
-class DomainColumn:
-    """
-    A domain-specialized processing column.
-    
-    Instead of spatial reference frames (useless for text agents),
-    each column maintains:
-    - A domain prototype (what this domain "looks like")
-    - Running prediction statistics (for calibrated surprise)
-    - Domain-specific attention weight
-    - Expertise confidence
-    
-    This is the Thousand Brains insight applied correctly to text:
-    parallel domain-specific processors that vote on classification
-    and flag anomalies within their expertise.
-    """
-    domain: DomainType
-    prototype: np.ndarray  # 384-dim domain centroid
-    
-    # Running statistics for prediction error calibration
-    error_mean: float = 0.0
-    error_var: float = 1.0
-    error_count: int = 0
-    
-    # Domain expertise
-    attention: float = 1.0
-    expertise: float = 0.0  # How much this column has learned
-    sample_count: int = 0
-    
-    def update_error_stats(self, error: float):
-        """
-        Online update of running mean/variance (Welford's algorithm).
-        This is crucial for calibrated prediction error — we need to
-        know what's "normal" surprise for this domain.
-        """
-        self.error_count += 1
-        delta = error - self.error_mean
-        self.error_mean += delta / self.error_count
-        delta2 = error - self.error_mean
-        self.error_var += (delta * delta2 - self.error_var) / self.error_count
-    
-    def is_surprising(self, error: float, threshold_sigma: float = 2.0) -> bool:
-        """
-        Is this prediction error genuinely surprising for this domain?
-        Uses calibrated threshold: error > mean + threshold * std.
-        """
-        if self.error_count < 10:
-            return error > 0.5  # Not enough data; use fixed threshold
-        std = max(np.sqrt(self.error_var), 1e-6)
-        return error > self.error_mean + threshold_sigma * std
-    
-    def compute_relevance(self, feature_vector: np.ndarray) -> float:
-        """How relevant is this input to this domain?"""
-        return float(np.dot(self.prototype, feature_vector))
-    
-    def update_prototype(self, feature_vector: np.ndarray, learning_rate: float = 0.01):
-        """Slowly update domain prototype toward new evidence."""
-        self.prototype = (1 - learning_rate) * self.prototype + learning_rate * feature_vector
-        norm = np.linalg.norm(self.prototype)
-        if norm > 0:
-            self.prototype /= norm
-        self.sample_count += 1
-        self.expertise = min(1.0, self.sample_count / 100.0)
-    
-    def to_dict(self) -> dict:
-        return {
-            'domain': self.domain.value,
-            'prototype': self.prototype.tolist() if self.prototype is not None else None,
-            'error_mean': self.error_mean,
-            'error_var': self.error_var,
-            'error_count': self.error_count,
-            'attention': self.attention,
-            'expertise': self.expertise,
-            'sample_count': self.sample_count,
-        }
 
 
 # =========================================================
@@ -626,14 +521,12 @@ class ARNv9:
     
     def __init__(self, data_dir: str = "./arn_data",
                  use_embeddings: bool = True,
-                 embedding_tier: Optional[str] = None,
+                 embedding_fn=None,
                  episodic_capacity: int = 4096,
-                 semantic_capacity: int = 2048,
-                 consolidation_threshold: int = 256,
-                 auto_consolidate: bool = True):
-        
+                 semantic_capacity: int = 2048):
+
         # Core components
-        self.embedder = EmbeddingEngine(use_model=use_embeddings, tier=embedding_tier)
+        self.embedder = EmbeddingEngine(use_model=use_embeddings, embedding_fn=embedding_fn)
         self.storage = StorageEngine(
             data_dir=data_dir,
             max_episodes=episodic_capacity,
@@ -646,14 +539,7 @@ class ARNv9:
         self.consolidation_engine = ConsolidationEngine(
             max_semantic_nodes=semantic_capacity
         )
-        
-        # Domain columns
-        self.columns = self._init_columns()
-        
-        # Configuration
-        self.consolidation_threshold = consolidation_threshold
-        self.auto_consolidate = auto_consolidate
-        
+
         # State
         self.total_experiences = 0
         self.consolidation_count = 0
@@ -675,132 +561,28 @@ class ARNv9:
         logger.info(f"ARN v9 initialized. Episodes: {self.storage.count_episodes()}, "
                      f"Semantics: {self.storage.count_semantics()}")
     
-    def _init_columns(self) -> List[DomainColumn]:
-        """Initialize domain-specialized columns."""
-        columns = []
-        
-        # Define domain seed phrases for initial prototypes
-        domain_seeds = {
-            DomainType.CODE: "programming code function variable algorithm software development",
-            DomainType.CONVERSATION: "hello thanks question answer discuss chat talk conversation",
-            DomainType.FACTS: "fact definition information data knowledge truth reference",
-            DomainType.PROCEDURES: "step process procedure workflow instruction guide how to",
-            DomainType.PREFERENCES: "prefer like want favorite choice setting option",
-            DomainType.TEMPORAL: "today yesterday tomorrow schedule date time event meeting",
-            DomainType.ERRORS: "error bug fix problem issue crash failure wrong broken",
-            DomainType.GENERAL: "general topic subject matter content information",
-        }
-        
-        for domain, seed in domain_seeds.items():
-            prototype = self.embedder.encode(seed, mode='passage')
-            columns.append(DomainColumn(
-                domain=domain,
-                prototype=prototype
-            ))
-        
-        return columns
-    
-    def _restore_column_prototypes(self, col_data: list):
-        """Restore column prototypes from saved state if available.
-
-        Skips any prototype whose dimension doesn't match the current
-        embedder dimension — this prevents a ValueError when the embedding
-        tier has been upgraded (e.g. nano 384-dim → base 768-dim) and the
-        stale saved prototypes are still 384-dim.  In that case the freshly
-        generated prototypes from _init_columns() are kept instead.
-        """
-        expected_dim = self.embedder.embedding_dim
-        for cd in col_data:
-            for col in self.columns:
-                if col.domain.value == cd.get('domain'):
-                    proto = cd.get('prototype')
-                    if proto is not None:
-                        arr = np.array(proto, dtype=np.float32)
-                        if arr.shape[0] != expected_dim:
-                            logger.warning(
-                                f"[ARN] Skipping saved prototype for domain "
-                                f"'{col.domain.value}': dim={arr.shape[0]} "
-                                f"!= expected {expected_dim} "
-                                f"(embedding tier was upgraded). "
-                                f"Fresh prototype will be used."
-                            )
-                            continue
-                        col.prototype = arr
-                        # Re-normalize in case of drift
-                        norm = np.linalg.norm(col.prototype)
-                        if norm > 0:
-                            col.prototype /= norm
-    
     def perceive(self, content: str, importance: float = 0.5,
                  context: dict = None, source: str = 'user',
                  memory_type: str = 'episode') -> dict:
         """
-        Process new input — the main "learning" entry point.
-        
-        Steps:
-        1. Encode to semantic vector
-        2. Compute prediction error against working memory context
-        3. Route through domain columns for calibrated surprise
-        4. Store as episodic memory
-        5. Update working memory
-        6. Maybe trigger consolidation
-        
-        Returns dict with episode_id, prediction_error, domain_signals, etc.
+        Store new content as an episodic memory.
+
+        Encodes content, computes prediction error vs. working memory context,
+        stores the episode, auto-links to similar memories, updates working memory.
+        Consolidation is opt-in — call arn.consolidate() explicitly.
         """
-        # Decay working memory based on elapsed time
         now = time.time()
         elapsed = now - self._last_decay_time
         self.working_memory.decay(elapsed_seconds=elapsed)
         self._last_decay_time = now
-        
-        # Step 1: Encode as a passage (stored content)
+
         feature_vector = self.embedder.encode(content, mode='passage')
-        
-        # Step 2: Prediction error against working memory context
+
         wm_context = self.working_memory.get_context_vector()
         if wm_context is not None:
             prediction_error = 1.0 - float(np.dot(feature_vector, wm_context))
         else:
-            prediction_error = 1.0  # No context = maximum surprise
-        
-        # Step 3: Domain column processing
-        domain_signals = []
-        best_domain = None
-        best_relevance = -1.0
-        
-        for column in self.columns:
-            relevance = column.compute_relevance(feature_vector)
-            is_surprising = column.is_surprising(prediction_error)
-            
-            domain_signals.append({
-                'domain': column.domain.value,
-                'relevance': relevance,
-                'surprising': is_surprising,
-                'expertise': column.expertise,
-            })
-            
-            if relevance > best_relevance:
-                best_relevance = relevance
-                best_domain = column
-        
-        # Update best matching column
-        if best_domain is not None:
-            best_domain.update_prototype(feature_vector, learning_rate=0.01)
-            best_domain.update_error_stats(prediction_error)
-        
-        # Boost importance if content is surprising across multiple domains
-        surprise_count = sum(1 for s in domain_signals if s['surprising'])
-        if surprise_count >= 3:
-            importance = min(0.95, importance + 0.2)
-        
-        # Step 4: Store episodic memory
-        # Check for contradictions with existing memories
-        contradiction_hits = []
-        try:
-            detector = ContradictionDetector(self.storage, self.embedder)
-            contradiction_hits = detector.check(content, top_k_candidates=15)
-        except Exception:
-            pass  # Contradiction detection is best-effort
+            prediction_error = 1.0
 
         episode_id = self.storage.store_episode(
             content=content,
@@ -812,18 +594,7 @@ class ARNv9:
             memory_type=memory_type,
         )
 
-        # If contradictions found, supersede the old episodes (never supersede api-seeded facts)
-        if contradiction_hits:
-            try:
-                for hit in contradiction_hits:
-                    old_ep = self.storage.get_episode(hit['old_episode_id'])
-                    if old_ep and old_ep.get('source') == 'api':
-                        continue
-                    detector.supersede_old(hit['old_episode_id'], episode_id)
-            except Exception:
-                pass
-        
-        # Auto-link: connect new memory to top-3 similar existing memories
+        # Auto-link to top-3 similar existing memories
         try:
             all_episodes = self.storage.get_all_episodes(consolidated=None)
             existing = [ep for ep in all_episodes if ep['id'] != episode_id]
@@ -832,45 +603,28 @@ class ARNv9:
                 ep_vectors, ep_ids = self.storage.get_episode_vectors(ep_ids_list)
                 if len(ep_vectors) > 0:
                     similarities = ep_vectors @ feature_vector
-                    scored = list(zip(ep_ids, similarities))
-                    scored.sort(key=lambda x: x[1], reverse=True)
+                    scored = sorted(zip(ep_ids, similarities), key=lambda x: x[1], reverse=True)
                     for other_id, sim in scored[:3]:
                         if float(sim) >= AUTO_LINK_SIMILARITY_THRESHOLD:
                             self.storage.create_link(
                                 episode_id, other_id, "relates_to", confidence=float(sim)
                             )
         except Exception:
-            pass  # Auto-linking is best-effort
-        
-        # Step 5: Update working memory
+            pass
+
         self.working_memory.add(
             content=content,
             vector=feature_vector,
             priority=importance,
             source_id=episode_id
         )
-        
         self.total_experiences += 1
-        
-        # Step 6: Auto-consolidation check
-        unconsolidated = self.storage.count_episodes(consolidated=False)
-        consolidation_triggered = False
-        if self.auto_consolidate and unconsolidated >= self.consolidation_threshold:
-            self.consolidate()
-            consolidation_triggered = True
-        
-        # Save working memory to disk
         self._save_working_memory()
-        
+
         return {
             'episode_id': episode_id,
             'prediction_error': prediction_error,
-            'domain_signals': domain_signals,
-            'best_domain': best_domain.domain.value if best_domain else None,
             'importance': importance,
-            'surprise_count': surprise_count,
-            'consolidation_triggered': consolidation_triggered,
-            'contradictions_found': len(contradiction_hits),
             'memory_type': memory_type,
         }
     
@@ -1071,16 +825,39 @@ class ARNv9:
             top_results.sort(key=lambda r: r['score'], reverse=True)
             top_results = top_results[:top_k]
         
-        # Tag each result with confidence level using calibrated thresholds.
-        # The calibrator learns the score distribution of the currently-loaded
-        # model, so thresholds adapt automatically when switching tiers.
+        # Prepend active working memory items not already in results
+        wm_active = self.working_memory.get_active()
+        existing_ids = {r['id'] for r in top_results if r['type'] == 'episodic'}
+        wm_additions = []
+        for slot in wm_active:
+            if slot.source_id >= 0 and slot.source_id not in existing_ids:
+                wm_additions.append({
+                    'type': 'episodic',
+                    'id': slot.source_id,
+                    'content': slot.content,
+                    'score': 2.0 + slot.activation,
+                    'similarity': 1.0,
+                    'importance': slot.activation,
+                    'created_at': slot.timestamp,
+                    'access_count': 0,
+                    'context': {},
+                    'memory_type': 'episode',
+                    'source': 'working_memory',
+                    'from_working_memory': True,
+                    'confidence_tier': 'high',
+                    'calibrated_confidence': 1.0,
+                })
+                existing_ids.add(slot.source_id)
+        top_results = wm_additions + top_results
+
         for r in top_results:
-            r['confidence_tier'] = self.embedder.confidence_tier(r['similarity'])
-            r['calibrated_confidence'] = round(
-                self.embedder.calibrate_similarity(r['similarity']), 3
-            )
-        
-        return top_results
+            if 'confidence_tier' not in r:
+                r['confidence_tier'] = self.embedder.confidence_tier(r['similarity'])
+                r['calibrated_confidence'] = round(
+                    self.embedder.calibrate_similarity(r['similarity']), 3
+                )
+
+        return top_results[:top_k + len(wm_additions)]
     
     def consolidate(self) -> dict:
         """
@@ -1111,7 +888,6 @@ class ARNv9:
             'working_memory_active': self.working_memory.count,
             'storage': storage_stats,
             'embeddings': embed_stats,
-            'columns': [c.to_dict() for c in self.columns],
         }
     
     def _load_state(self):
@@ -1121,25 +897,12 @@ class ARNv9:
             data = json.loads(state)
             self.total_experiences = data.get('total_experiences', 0)
             self.consolidation_count = data.get('consolidation_count', 0)
-            
-            # Restore column stats and prototypes
-            col_data = data.get('columns', [])
-            for cd in col_data:
-                for col in self.columns:
-                    if col.domain.value == cd.get('domain'):
-                        col.error_mean = cd.get('error_mean', 0.0)
-                        col.error_var = cd.get('error_var', 1.0)
-                        col.error_count = cd.get('error_count', 0)
-                        col.expertise = cd.get('expertise', 0.0)
-                        col.sample_count = cd.get('sample_count', 0)
-            self._restore_column_prototypes(col_data)
     
     def _save_state(self):
         """Persist current state."""
         state = {
             'total_experiences': self.total_experiences,
             'consolidation_count': self.consolidation_count,
-            'columns': [c.to_dict() for c in self.columns],
         }
         self.storage.set_state('arn_state', json.dumps(state))
     

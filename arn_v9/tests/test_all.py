@@ -40,7 +40,7 @@ from arn_v9.core.embeddings import EmbeddingEngine, EMBEDDING_DIM
 from arn_v9.storage import persistence as persistence_module
 from arn_v9.storage.persistence import StorageEngine
 from arn_v9.core.cognitive import (
-    ARNv9, DomainColumn, DomainType, WorkingMemory, ConsolidationEngine
+    ARNv9, WorkingMemory, ConsolidationEngine
 )
 
 
@@ -562,52 +562,6 @@ def test_embedding_quality():
     results.bench("Batch encode (100 texts)", elapsed * 1000, "ms")
 
 
-@requires_embeddings
-def test_prediction_error():
-    """Test prediction error calibration (REQUIRES model)."""
-    print("\n[TIER 2] PREDICTION ERROR CALIBRATION")
-    print("-" * 40)
-
-    engine = EmbeddingEngine(use_model=True)
-
-    col = DomainColumn(
-        domain=DomainType.CODE,
-        prototype=engine.encode("programming code development")
-    )
-
-    errors = np.random.normal(0.5, 0.1, 50)
-    for e in errors:
-        col.update_error_stats(float(e))
-
-    if abs(col.error_mean - 0.5) < 0.1:
-        results.ok(f"Error mean converges ({col.error_mean:.3f} ≈ 0.5)")
-    else:
-        results.fail("Error mean", f"{col.error_mean:.3f}")
-
-    if abs(np.sqrt(col.error_var) - 0.1) < 0.05:
-        results.ok(f"Error std converges ({np.sqrt(col.error_var):.3f} ≈ 0.1)")
-    else:
-        results.fail("Error std", f"{np.sqrt(col.error_var):.3f}")
-
-    if not col.is_surprising(0.55):
-        results.ok("Normal error not flagged as surprising")
-    else:
-        results.fail("Normal not surprising", "0.55 flagged")
-
-    if col.is_surprising(0.9):
-        results.ok("Extreme error flagged as surprising")
-    else:
-        results.fail("Extreme surprising", "0.9 not flagged")
-
-    # Domain relevance
-    code_vec = engine.encode("def function(): return True")
-    cooking_vec = engine.encode("bake the cake at 350 degrees")
-    code_rel = col.compute_relevance(code_vec)
-    cook_rel = col.compute_relevance(cooking_vec)
-    if code_rel > cook_rel:
-        results.ok(f"Code column prefers code ({code_rel:.3f} > {cook_rel:.3f})")
-    else:
-        results.fail("Domain relevance", f"code={code_rel:.3f}, cooking={cook_rel:.3f}")
 
 
 @requires_embeddings
@@ -661,49 +615,6 @@ def test_consolidation():
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-@requires_embeddings
-def test_contradiction_detection():
-    """Test contradiction detection (REQUIRES model)."""
-    print("\n[TIER 2] CONTRADICTION DETECTION")
-    print("-" * 40)
-
-    tmp_dir = make_temp_dir()
-    engine = EmbeddingEngine(use_model=True)
-
-    try:
-        with StorageEngine(tmp_dir) as storage:
-            episodes = [
-                "The user's favorite language is Python",
-                "The user's favorite language is Rust",
-                "The user prefers Python for all projects",
-                "The user switched from Python to Rust recently",
-                "Rust is the user's primary programming language now",
-            ]
-            for text in episodes:
-                storage.store_episode(text, engine.encode(text), importance=0.6)
-
-            consolidator = ConsolidationEngine(
-                similarity_threshold=0.40, min_cluster_size=2, contradiction_threshold=0.4
-            )
-            stats = consolidator.consolidate(storage, engine)
-
-            if stats['contradictions_found'] > 0:
-                results.ok(f"Contradictions detected ({stats['contradictions_found']})")
-            else:
-                results.ok("Contradiction detection ran (0 found — heuristic may need tuning)")
-
-            semantics = storage.get_all_semantics()
-            has_contradictions = any(
-                s.get('contradiction_log') or
-                (s.get('schema', {}).get('contradictions'))
-                for s in semantics
-            )
-            if has_contradictions:
-                results.ok("Contradictions logged in semantic nodes")
-            else:
-                results.ok("Semantic nodes created (contradiction logging active)")
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 @requires_embeddings
@@ -714,7 +625,7 @@ def test_full_integration():
 
     tmp_dir = make_temp_dir()
     try:
-        with ARNv9(data_dir=tmp_dir, auto_consolidate=False) as arn:
+        with ARNv9(data_dir=tmp_dir) as arn:
             result = arn.perceive(
                 "The user's name is Mtr and they work on OpenClaw",
                 importance=0.9, context={'source': 'conversation'}
@@ -735,7 +646,7 @@ def test_full_integration():
                 results.fail("Domain routing", "No best domain")
 
         # Recall after restart
-        with ARNv9(data_dir=tmp_dir, auto_consolidate=False) as arn:
+        with ARNv9(data_dir=tmp_dir) as arn:
             recalls = arn.recall("What is the user's name?")
             if recalls and 'Mtr' in recalls[0]['content']:
                 results.ok(f"Recall finds content after restart (score={recalls[0]['score']:.3f})")
@@ -743,7 +654,7 @@ def test_full_integration():
                 results.fail("Recall after restart", f"Got: {recalls[:1]}")
 
         # Multi-topic
-        with ARNv9(data_dir=tmp_dir, auto_consolidate=False) as arn:
+        with ARNv9(data_dir=tmp_dir) as arn:
             topics = [
                 ("Python is the user's favorite language", 0.8),
                 ("The user runs Raspberry Pi 5 as homelab", 0.7),
@@ -783,7 +694,7 @@ def test_total_experiences_seeded_from_db():
 
     tmp_dir = make_temp_dir()
     try:
-        with ARNv9(data_dir=tmp_dir, auto_consolidate=False) as arn:
+        with ARNv9(data_dir=tmp_dir) as arn:
             arn.perceive("First memory", importance=0.5)
             arn.perceive("Second memory", importance=0.5)
             stats = arn.get_stats()
@@ -793,7 +704,7 @@ def test_total_experiences_seeded_from_db():
                 results.fail("total_experiences initial", f"Expected 2, got {stats['total_experiences']}")
 
         # Restart — total_experiences should seed from DB count
-        with ARNv9(data_dir=tmp_dir, auto_consolidate=False) as arn:
+        with ARNv9(data_dir=tmp_dir) as arn:
             stats = arn.get_stats()
             if stats['total_experiences'] == 2:
                 results.ok("total_experiences seeded from DB on restart")
@@ -896,7 +807,7 @@ def test_precision_recall_quality():
             ("The Great Wall of China is over 21000 kilometers long", "How long is the Great Wall of China?"),
         ]
 
-        with ARNv9(data_dir=tmp_dir, auto_consolidate=False) as arn:
+        with ARNv9(data_dir=tmp_dir) as arn:
             for content, _ in facts:
                 arn.perceive(content, importance=0.8, memory_type="fact")
 
@@ -971,9 +882,7 @@ def main():
         test_working_memory,
         # Tier 2: require embeddings
         test_embedding_quality,
-        test_prediction_error,
         test_consolidation,
-        test_contradiction_detection,
         test_full_integration,
         test_agent_simulation,
         test_precision_recall_quality,

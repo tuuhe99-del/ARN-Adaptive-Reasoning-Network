@@ -32,8 +32,6 @@ dependencies = [
     "sentence-transformers>=2.7",
     "psutil>=5.9",
     "httpx>=0.27",
-    "python-telegram-bot[job-queue]>=20.0",
-    "watchdog>=3.0",
 ]
 
 [project.optional-dependencies]
@@ -44,13 +42,10 @@ Homepage = "https://github.com/MohamedMohamed/arn-v9"
 Issues = "https://github.com/MohamedMohamed/arn-v9/issues"
 
 [project.scripts]
-arn-server = "arn_v9.api.server:main"
-arn-cli = "arn_v9.cli:main"
-arn-collab-runner = "arn_v9.collab_runner:main"
-arn-telegram-bot = "arn_v9.scripts.telegram_bot.main:main"
+arn = "arn_v9.cli:main"
 
 [tool.setuptools]
-packages = ["arn_v9", "arn_v9.core", "arn_v9.storage", "arn_v9.api", "arn_v9.scripts", "arn_v9.scripts.telegram_bot", "arn_v9.tests", "arn_v9.benchmarks"]
+packages = ["arn_v9", "arn_v9.core", "arn_v9.storage", "arn_v9.api", "arn_v9.scripts", "arn_v9.tests", "arn_v9.benchmarks"]
 
 [tool.setuptools.package-data]
-arn_v9 = ["openclaw_skill/SKILL.md", "Dockerfile", "requirements.txt"]
+arn_v9 = ["requirements.txt"]

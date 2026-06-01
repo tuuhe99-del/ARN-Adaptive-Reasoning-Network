@@ -96,131 +96,6 @@ async def rate_limit_dep(request: Request):
         raise HTTPException(status_code=429, detail="Rate limit exceeded")
 
 
-# =========================================================
-# CONTRADICTION DETECTION
-# =========================================================
-
-# Only these patterns are checked for contradictions.
-# Each tuple is (compiled_regex, category_label).
-# A contradiction is: same pattern matches both old and new fact,
-# but the captured group (the "value") differs.
-#
-# Conservative design: we only supersede facts where we can prove
-# the subject+attribute is the same but the value changed.
-# "User is working on X" is intentionally excluded — users can
-# work on multiple projects simultaneously.
-_CONTRADICTION_TEMPLATES = [
-    # Language/tool preference: "User prefers Python", "User uses JavaScript"
-    (re.compile(
-        r"^User (?:prefer|like|use|work with)s?\s+(.+)$",
-        re.IGNORECASE,
-    ), "tool_preference"),
-    # Name: "User's name is Alex"
-    (re.compile(
-        r"^User'?s? name is\s+(.+)$",
-        re.IGNORECASE,
-    ), "name"),
-    # Location: "User is based in X", "User lives in X"
-    (re.compile(
-        r"^User (?:is based in|lives? in|is from|is located in)\s+(.+)$",
-        re.IGNORECASE,
-    ), "location"),
-]
-
-# Sources that are NEVER superseded (manually seeded / authoritative facts)
-_PROTECTED_SOURCES = {"api"}
-
-# Sources eligible for supersession
-_SUPERSEDABLE_SOURCES = {"user", "agent", "extracted_fact"}
-
-
-def _check_and_supersede_contradictions(
-    plugin,
-    new_content: str,
-    memory_type: str,
-    source: str,
-    new_episode_id: int,
-) -> None:
-    """
-    Conservative contradiction detector.
-
-    Runs after a new extracted_fact is stored.  For each contradiction
-    template: if the new fact matches a pattern AND an existing *active*
-    fact of the same memory_type also matches the same pattern with a
-    DIFFERENT captured value → supersede the old fact by setting
-    invalidated_at and superseded_by.
-
-    Safety guarantees:
-    - Never runs when source == 'api' (protects seeded facts)
-    - Never supersedes facts whose source is in _PROTECTED_SOURCES
-    - Only checks facts of the same memory_type
-    - Uses exact pattern matching, NOT semantic similarity
-    """
-    # Guard 1: only process extracted/user/agent facts, never api stores
-    if source in _PROTECTED_SOURCES:
-        return
-
-    conn = plugin._arn.storage._get_conn()
-    now = time.time()
-
-    for pattern, _category in _CONTRADICTION_TEMPLATES:
-        new_match = pattern.match(new_content.strip())
-        if new_match is None:
-            continue
-
-        new_value = new_match.group(1).strip().lower()
-
-        # Fetch all active (non-invalidated) episodes of the same memory_type
-        # whose source is supersedable.  Exclude the just-inserted episode.
-        rows = conn.execute(
-            """
-            SELECT id, content, source
-            FROM episodes
-            WHERE memory_type = ?
-              AND invalidated_at IS NULL
-              AND id != ?
-            """,
-            (memory_type, new_episode_id),
-        ).fetchall()
-
-        for row in rows:
-            old_id = row[0]
-            old_content = row[1]
-            old_source = row[2]
-
-            # Guard 2: never supersede protected sources
-            if old_source in _PROTECTED_SOURCES:
-                continue
-
-            # Guard 3: old source must be supersedable
-            if old_source not in _SUPERSEDABLE_SOURCES:
-                continue
-
-            old_match = pattern.match(old_content.strip())
-            if old_match is None:
-                continue
-
-            old_value = old_match.group(1).strip().lower()
-
-            # Only supersede if the value actually changed
-            if old_value == new_value:
-                continue
-
-            # Supersede the old fact
-            conn.execute(
-                """
-                UPDATE episodes
-                SET invalidated_at = ?,
-                    superseded_by  = ?
-                WHERE id = ?
-                """,
-                (now, new_episode_id, old_id),
-            )
-            conn.commit()
-            logger.info(
-                f"[ARN] superseded episode {old_id} with {new_episode_id}: "
-                f"{old_content[:50]} → {new_content[:50]}"
-            )
 
 
 IDEA_PATTERNS = [
@@ -500,8 +375,6 @@ class StoreResponse(BaseModel):
     stored: bool
     episode_id: int
     prediction_error: float
-    domain: Optional[str]
-    surprising: bool
 
 
 class RecallRequest(BaseModel):
@@ -526,7 +399,6 @@ class RecallResult(BaseModel):
     importance: Optional[float] = None
     confidence: Optional[float] = None
     evidence_count: Optional[int] = None
-    has_contradictions: Optional[bool] = None
     age_hours: Optional[float] = None
     created_at: Optional[float] = None
     memory_type: Optional[str] = None
@@ -694,10 +566,6 @@ class AgentPool:
             self._plugins[agent_id] = ARNPlugin(
                 agent_id=agent_id,
                 data_root=self._data_root,
-                auto_consolidate=True,
-                # High threshold prevents noise from triggering consolidation.
-                # Override via ARN_CONSOLIDATION_THRESHOLD env var.
-                consolidation_threshold=int(os.environ.get("ARN_CONSOLIDATION_THRESHOLD", "2048")),
             )
 
         self._access_times[agent_id] = time.time()
@@ -947,26 +815,10 @@ async def store_memory(req: StoreRequest):
         memory_type=req.memory_type,
     )
 
-    # Run contradiction detection for extracted facts.
-    # This is intentionally gated to extracted_fact source only so that
-    # raw user/agent messages (which are often partial sentences) don't
-    # trigger false-positive supersessions.
-    if req.source == "extracted_fact":
-        await asyncio.to_thread(
-            _check_and_supersede_contradictions,
-            plugin,
-            req.content,
-            req.memory_type,
-            req.source,
-            result["episode_id"],
-        )
-
     return StoreResponse(
         stored=result["stored"],
         episode_id=result["episode_id"],
         prediction_error=round(result["prediction_error"], 4),
-        domain=result.get("domain"),
-        surprising=result.get("surprising", False),
     )
 
 
@@ -1599,9 +1451,6 @@ async def store_exchange(req: ExchangeRequest):
             )
             if res.get("stored"):
                 stored_ids.append(res["episode_id"])
-                _check_and_supersede_contradictions(
-                    plugin, fact["content"], fact["memory_type"], "extracted_fact", res["episode_id"]
-                )
 
         # Extract ideas/plans/hypotheticals from the user message
         try:

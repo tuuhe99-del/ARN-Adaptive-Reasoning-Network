@@ -54,79 +54,36 @@ sys.path.insert(0, str(_package_root))
 sys.path.insert(0, str(Path.home()))
 
 
-# ─── Resolve config from env with correct variable names ───
+# ─── Resolve config from env ───
 def get_config():
-    """
-    Single source of truth for all configuration.
-    Reads env vars with correct names, provides sensible defaults.
-    """
-    # ARN_DATA_DIR is the canonical var. Also check legacy ARN_DATA_ROOT.
     data_dir = os.environ.get(
         'ARN_DATA_DIR',
         os.environ.get('ARN_DATA_ROOT', str(Path.home() / '.arn_data'))
     )
-    
-    # ARN_EMBEDDING_TIER is the canonical var. 
-    # If someone set ARN_EMBEDDING_MODEL, translate it.
-    tier = os.environ.get('ARN_EMBEDDING_TIER', None)
-    if tier is None:
-        model = os.environ.get('ARN_EMBEDDING_MODEL', '')
-        tier = _model_to_tier(model) if model else 'nano'
-    
-    agent_id = os.environ.get(
-        'ARN_AGENT_ID',
-        os.environ.get('OPENCLAW_AGENT_ID', 'default')
-    )
+    agent_id = os.environ.get('ARN_AGENT_ID', os.environ.get('OPENCLAW_AGENT_ID', 'default'))
     use_embeddings_raw = os.environ.get('ARN_USE_EMBEDDINGS', '1').strip().lower()
     use_embeddings = use_embeddings_raw not in {'0', 'false', 'no', 'off'}
-    
+
     return {
         'data_dir': data_dir,
-        'tier': tier,
         'agent_id': agent_id,
         'use_embeddings': use_embeddings,
     }
 
 
-def _model_to_tier(model_name: str) -> str:
-    """Translate a model name to the correct tier string."""
-    mapping = {
-        'all-MiniLM-L6-v2': 'nano',
-        'sentence-transformers/all-MiniLM-L6-v2': 'nano',
-        'all-mpnet-base-v2': 'small',
-        'sentence-transformers/all-mpnet-base-v2': 'small',
-        'bge-base-en-v1.5': 'base',
-        'BAAI/bge-base-en-v1.5': 'base',
-        'e5-base-v2': 'base-e5',
-        'intfloat/e5-base-v2': 'base-e5',
-    }
-    for key, tier in mapping.items():
-        if key in model_name:
-            return tier
-    return 'nano'  # Safe default
-
-
 # ─── Plugin factory ───
 def get_plugin(strict: bool = False, config: dict = None):
-    """
-    Create a plugin instance with correct config.
-    Always uses ARN_EMBEDDING_TIER (not model name) and
-    consistent data directory.
-    """
     from arn_v9.plugin import ARNPlugin
-    
+
     if config is None:
         config = get_config()
-    
+
     plugin = ARNPlugin(
         agent_id=config['agent_id'],
         data_root=config['data_dir'],
         use_embeddings=config.get('use_embeddings', True),
-        embedding_tier=config['tier'],
-        auto_consolidate=True,
-        consolidation_threshold=128,
     )
-    
+
     if plugin._arn.embedder.is_degraded and config.get('use_embeddings', True):
         msg = (
             "Embedding model not loaded. Memory will not work correctly.\n"
@@ -139,7 +96,7 @@ def get_plugin(strict: bool = False, config: dict = None):
             sys.exit(1)
         else:
             print(f"WARNING: {msg}", file=sys.stderr)
-    
+
     return plugin
 
 
@@ -156,7 +113,6 @@ def cmd_store(args):
             importance=args.importance,
             tags=tags,
             source=args.source,
-            time_context=args.time_context,
         )
         print(json.dumps(result, indent=2))
 
@@ -167,7 +123,6 @@ def cmd_recall(args):
         results = plugin.recall(
             query=args.query,
             top_k=args.top_k,
-            time_filter=args.time_filter,
         )
         print(json.dumps(results, indent=2))
 
@@ -628,29 +583,16 @@ arn maintain
 
 
 def cmd_setup(args):
-    """
-    One-command setup for ARN + AI client integration.
-    
-    Handles:
-    1. Dependency verification
-    2. Data directory creation
-    3. Environment variables (persistent via ~/.bashrc)
-    4. Model download and verification
-    5. Store/recall round-trip test
-    6. Client-specific instruction files
-    """
-    tier = args.tier
+    """One-command setup for ARN + AI client integration."""
     client = args.client
     data_dir = Path(args.data_dir) if args.data_dir else Path.home() / '.arn_data'
-    
-    print(f"\nARN v9 Setup")
-    print(f"  Tier:   {tier}")
+
+    print(f"\nARN Setup")
     print(f"  Client: {client or 'none'}")
     print(f"  Data:   {data_dir}\n")
-    
-    # Step 1: Check dependencies
+
+    # Check dependencies
     print("Checking dependencies...")
-    
     missing = []
     try:
         import numpy
@@ -658,138 +600,96 @@ def cmd_setup(args):
     except ImportError:
         missing.append('numpy')
         print(f"  numpy: MISSING")
-    
+
     try:
         import sentence_transformers
         print(f"  sentence-transformers: ok")
     except ImportError:
         missing.append('sentence-transformers')
         print(f"  sentence-transformers: MISSING")
-    
+
     if missing:
         print(f"\nInstall missing packages:")
         print(f"  pip install {' '.join(missing)}")
-        print(f"\nThen re-run: arn setup --tier {tier}")
         sys.exit(1)
-    
-    # Optional deps
-    for pkg, label in [('rank_bm25', 'BM25 search'), ('spacy', 'entity extraction')]:
-        try:
-            __import__(pkg)
-            print(f"  {label}: ok")
-        except ImportError:
-            print(f"  {label}: not installed (optional)")
-    
-    # Step 2: Create data directory
-    print(f"\nSetting up directories...")
+
+    # Create data directory
     data_dir.mkdir(parents=True, exist_ok=True)
     (data_dir / 'default').mkdir(exist_ok=True)
-    print(f"  Created: {data_dir}")
-    
-    # Step 3: Set environment variables persistently
-    print(f"\nConfiguring environment...")
+    print(f"\nData directory: {data_dir}")
+
+    # Set environment variables persistently
     env_lines = {
         'ARN_DATA_DIR': str(data_dir),
-        'ARN_EMBEDDING_TIER': tier,
         'ARN_AGENT_ID': 'default',
     }
-    
+
     bashrc = Path.home() / '.bashrc'
     if bashrc.exists():
         content = bashrc.read_text()
         additions = []
         for var, val in env_lines.items():
-            # Remove any existing ARN env lines first
             lines = content.split('\n')
             lines = [l for l in lines if not l.strip().startswith(f'export {var}=')]
             content = '\n'.join(lines)
             additions.append(f'export {var}="{val}"')
-        
+
         with open(bashrc, 'w') as f:
-            f.write(content.rstrip() + '\n\n# ARN v9 configuration\n')
+            f.write(content.rstrip() + '\n\n# ARN configuration\n')
             f.write('\n'.join(additions) + '\n')
-        
+
         print(f"  Updated ~/.bashrc")
-    
-    # Set for current process too
+
     for var, val in env_lines.items():
         os.environ[var] = val
-        print(f"  {var}={val}")
-    
-    # Step 4: Download model
-    print(f"\nDownloading embedding model ({tier})...")
-    print(f"  This may take 1-2 minutes on first run...")
-    
+
+    # Download model
+    from arn_v9.core.embeddings import EmbeddingEngine, MODEL_NAME
+    print(f"\nDownloading model: {MODEL_NAME}")
+    print(f"  (first run: 1-2 minutes)")
+
     try:
-        from arn_v9.core.embeddings import EmbeddingEngine, MODEL_CONFIGS
-        model_info = MODEL_CONFIGS.get(tier, MODEL_CONFIGS['nano'])
-        print(f"  Model: {model_info['name']}")
-        
-        engine = EmbeddingEngine(use_model=True, tier=tier)
+        engine = EmbeddingEngine(use_model=True)
         if engine.is_degraded:
             print(f"  WARNING: Model failed to load. Check internet connection.")
-            print(f"  ARN will retry on next use.")
         else:
             test_vec = engine.encode("test")
-            print(f"  Loaded: {test_vec.shape[0]}-dimensional vectors")
-            print(f"  Status: ready")
+            print(f"  Loaded: {test_vec.shape[0]}-dim vectors. Ready.")
     except Exception as e:
-        print(f"  Model download issue: {e}")
-        print(f"  ARN will retry on first use.")
-    
-    # Step 5: Test store/recall
+        print(f"  Model issue: {e}. ARN will retry on first use.")
+
+    # Test store/recall
     print(f"\nTesting memory...")
     try:
         from arn_v9.plugin import ARNPlugin
-        plugin = ARNPlugin(
-            agent_id='default',
-            data_root=str(data_dir),
-            embedding_tier=tier,
-        )
-        
-        plugin.store(
-            content="ARN setup test — this will be deleted",
-            importance=0.5,
-            source='setup',
-        )
-        
+        plugin = ARNPlugin(agent_id='default', data_root=str(data_dir))
+        plugin.store(content="ARN setup test", importance=0.5, source='setup')
         results = plugin.recall("ARN setup test", top_k=1)
-        if results and 'setup test' in results[0].get('content', ''):
+        if results:
             print(f"  Store:  ok")
             print(f"  Recall: ok (confidence: {results[0].get('confidence_tier', 'unknown')})")
-            # Clean up test memory
             if results[0].get('type') == 'episodic':
                 plugin._arn.storage.delete_episodes([results[0]['id']])
-        else:
-            print(f"  Store:  ok")
-            print(f"  Recall: returned different result (model may still be loading)")
-        
         plugin.shutdown()
     except Exception as e:
         print(f"  Test failed: {e}")
-    
-    # Step 6: Client integration
+
     if client:
         print(f"\nSetting up {client} integration...")
-        _setup_client(client, tier)
-    
-    # Done
+        _setup_client(client)
+
     print(f"\n{'='*50}")
-    print(f"ARN memory is ready.")
-    print(f"  Model:  {tier}")
-    print(f"  Data:   {data_dir}")
-    print(f"  Agent:  default")
-    if client:
-        print(f"  Client: {client}")
-    print(f"\nQuick test:")
+    print(f"ARN ready.")
+    print(f"  Data: {data_dir}")
+    print(f"\nQuick start:")
     print(f'  arn store -c "My name is Mohamed" -i 0.9')
     print(f'  arn recall -q "what is my name" -k 1')
     if bashrc.exists():
-        print(f"\nRestart your terminal or run: source ~/.bashrc")
+        print(f"\nRestart terminal or: source ~/.bashrc")
     print()
 
 
-def _setup_client(client: str, tier: str):
+def _setup_client(client: str):
     """Write client-specific instruction files."""
     template = _CLIENT_INSTRUCTIONS.get(client)
     if not template:
@@ -839,6 +739,17 @@ def _setup_client(client: str, tier: str):
     print(f"  {client} integration configured")
 
 
+def cmd_server(args):
+    """Start the HTTP API server."""
+    import uvicorn
+    uvicorn.run(
+        "arn_v9.api.server:app",
+        host=args.host,
+        port=args.port,
+        workers=1,
+    )
+
+
 # ═══════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════
@@ -846,37 +757,32 @@ def _setup_client(client: str, tier: str):
 def main():
     parser = argparse.ArgumentParser(
         prog='arn',
-        description='ARN v9 — Persistent memory for AI agents',
+        description='ARN — Persistent memory for AI agents',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Quick start:
-  arn setup --tier nano --client codex
+  arn setup
   arn store -c "User prefers Python" -i 0.8
   arn recall -q "programming preferences" -k 3
   arn stats
-
-Clients: codex, claude, kimi, openclaw
-Tiers:   nano (22MB, fast), small (420MB), base (440MB, best), base-e5 (440MB)
+  arn server
         """
     )
     parser.add_argument('--strict', action='store_true', default=False,
                         help='Exit with error if embedding model unavailable')
-    
+
     sub = parser.add_subparsers(dest='command')
     sub.required = True
-    
+
     # ─── setup ───
-    p_setup = sub.add_parser('setup', help='One-command setup and integration')
-    p_setup.add_argument('--tier', '-t', default='nano',
-                         choices=['nano', 'small', 'base', 'base-e5'],
-                         help='Embedding model tier (default: nano)')
+    p_setup = sub.add_parser('setup', help='First-time setup and integration')
     p_setup.add_argument('--client', '-c', default=None,
                          choices=['codex', 'claude', 'kimi', 'openclaw'],
                          help='AI client to integrate with')
     p_setup.add_argument('--data-dir', '-d', default=None,
-                         help=f'Data directory (default: ~/.arn_data)')
+                         help='Data directory (default: ~/.arn_data)')
     p_setup.set_defaults(func=cmd_setup)
-    
+
     # ─── store ───
     p_store = sub.add_parser('store', help='Store a memory')
     p_store.add_argument('--content', '-c', required=True,
@@ -887,20 +793,14 @@ Tiers:   nano (22MB, fast), small (420MB), base (440MB, best), base-e5 (440MB)
                          help='Comma-separated tags')
     p_store.add_argument('--source', '-s', default='agent',
                          help='Source (default: agent)')
-    p_store.add_argument('--time-context', default='current',
-                         choices=['past', 'current', 'future'],
-                         help='Temporal scope (default: current)')
     p_store.set_defaults(func=cmd_store)
-    
+
     # ─── recall ───
     p_recall = sub.add_parser('recall', help='Recall relevant memories')
     p_recall.add_argument('--query', '-q', required=True,
                           help='Natural language query')
     p_recall.add_argument('--top-k', '-k', type=int, default=5,
                           help='Number of results (default: 5)')
-    p_recall.add_argument('--time-filter', default=None,
-                          choices=['past', 'current', 'future'],
-                          help='Temporal filter')
     p_recall.set_defaults(func=cmd_recall)
     
     # ─── context ───
@@ -921,13 +821,19 @@ Tiers:   nano (22MB, fast), small (420MB), base (440MB, best), base-e5 (440MB)
                           help='Min similarity to delete (default: 0.5)')
     p_forget.set_defaults(func=cmd_forget)
     
-    # ─── maintain ───
-    p_maint = sub.add_parser('maintain', help='Run memory consolidation')
+    # ─── consolidate ───
+    p_maint = sub.add_parser('consolidate', help='Run memory consolidation explicitly')
     p_maint.set_defaults(func=cmd_maintain)
-    
+
     # ─── stats ───
     p_stats = sub.add_parser('stats', help='Show memory statistics')
     p_stats.set_defaults(func=cmd_stats)
+
+    # ─── server ───
+    p_server = sub.add_parser('server', help='Start the HTTP API server')
+    p_server.add_argument('--host', default='0.0.0.0', help='Bind host (default: 0.0.0.0)')
+    p_server.add_argument('--port', '-p', type=int, default=8742, help='Port (default: 8742)')
+    p_server.set_defaults(func=cmd_server)
 
     # ─── collab ───
     p_collab = sub.add_parser('collab', help='Manage multi-agent handoffs')
