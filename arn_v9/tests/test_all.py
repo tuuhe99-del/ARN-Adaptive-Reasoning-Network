@@ -227,34 +227,28 @@ def test_persistence():
             else:
                 results.fail("Persistence", f"count={count} after restart")
 
-        # Corrupted vector files should not prevent startup
-        corrupt_dir = make_temp_dir()
-        try:
-            for filename in ("episodic_vectors.npy", "semantic_vectors.npy"):
-                with open(os.path.join(corrupt_dir, filename), "wb") as f:
-                    f.write(b"not a valid numpy file")
-            with StorageEngine(corrupt_dir) as storage:
-                expected_shapes = (
-                    storage._episodic_vectors.shape == (4096, EMBEDDING_DIM)
-                    and storage._semantic_vectors.shape == (2048, EMBEDDING_DIM)
-                )
-                quarantined = os.listdir(corrupt_dir)
-                has_quarantines = (
-                    any(name.startswith("episodic_vectors.npy.corrupt-") for name in quarantined)
-                    and any(name.startswith("semantic_vectors.npy.corrupt-") for name in quarantined)
-                )
-                if expected_shapes and has_quarantines:
-                    results.ok("Corrupted vectors are quarantined and rebuilt")
-                elif not expected_shapes:
-                    results.fail(
-                        "Corrupt vector recovery",
-                        f"Unexpected shapes: {storage._episodic_vectors.shape}, "
-                        f"{storage._semantic_vectors.shape}",
-                    )
-                else:
-                    results.fail("Corrupt vector quarantine", "Missing quarantined file")
-        finally:
-            shutil.rmtree(corrupt_dir, ignore_errors=True)
+        # sqlite-vec and FTS5 tables exist after init
+        with StorageEngine(tmp_dir) as storage:
+            conn = storage._get_conn()
+            tables = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type IN ('table', 'shadow')"
+            ).fetchall()}
+            vtables = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' OR type='shadow'"
+            ).fetchall()}
+            # Check that KNN search works (sqlite-vec loaded)
+            vec = random_vec()
+            eid = storage.store_episode("knn check episode", vec)
+            knn = storage.knn_search(vec, top_k=1)
+            fts = storage.fts_search("knn check episode", top_k=1)
+            if knn and knn[0][0] == eid:
+                results.ok("sqlite-vec KNN search functional")
+            else:
+                results.fail("sqlite-vec KNN search", f"knn={knn}")
+            if fts and fts[0][0] == eid:
+                results.ok("FTS5 keyword search functional")
+            else:
+                results.fail("FTS5 keyword search", f"fts={fts}")
 
         # Semantic node storage
         with StorageEngine(tmp_dir) as storage:
@@ -266,94 +260,20 @@ def test_persistence():
             else:
                 results.fail("Semantic storage", f"Got: {sems}")
 
-        # Atomic vector expansion preserves existing vectors
-        expansion_dir = make_temp_dir()
+        # Vectors persist across restarts (stored in sqlite-vec, not mmap)
+        persist_vec_dir = make_temp_dir()
         try:
-            with StorageEngine(expansion_dir, max_episodes=2, max_semantics=2) as storage:
-                ep_vec = random_vec()
-                sem_vec = random_vec()
-                storage._episodic_vectors[0] = ep_vec
-                storage._semantic_vectors[0] = sem_vec
-
-                storage._expand_episodic_vectors()
-                storage._expand_semantic_vectors()
-
-                ep_ok = (
-                    storage._episodic_vectors.shape == (4, EMBEDDING_DIM)
-                    and np.allclose(storage._episodic_vectors[0], ep_vec)
-                )
-                sem_ok = (
-                    storage._semantic_vectors.shape == (4, EMBEDDING_DIM)
-                    and np.allclose(storage._semantic_vectors[0], sem_vec)
-                )
-                if ep_ok and sem_ok:
-                    results.ok("Vector expansion preserves existing vectors")
+            original_vec = random_vec()
+            with StorageEngine(persist_vec_dir) as storage:
+                eid = storage.store_episode("vector persistence check", original_vec)
+            with StorageEngine(persist_vec_dir) as storage:
+                vecs, ids = storage.get_episode_vectors([eid])
+                if len(vecs) == 1 and np.allclose(vecs[0], original_vec, atol=1e-5):
+                    results.ok("Vectors persist across restarts (sqlite-vec)")
                 else:
-                    results.fail(
-                        "Vector expansion preservation",
-                        f"episodic={storage._episodic_vectors.shape}, "
-                        f"semantic={storage._semantic_vectors.shape}",
-                    )
+                    results.fail("Vector persistence", f"vecs={vecs}")
         finally:
-            shutil.rmtree(expansion_dir, ignore_errors=True)
-
-        # Failed temp writes must not replace the active vector file
-        failure_dir = make_temp_dir()
-        original_np_save = persistence_module.np.save
-        try:
-            with StorageEngine(failure_dir, max_episodes=2, max_semantics=2) as storage:
-                ep_vec = random_vec()
-                storage._episodic_vectors[0] = ep_vec
-                storage._episodic_vectors.flush()
-
-                def fail_save(*args, **kwargs):
-                    raise RuntimeError("simulated temp write failure")
-
-                persistence_module.np.save = fail_save
-                try:
-                    storage._expand_episodic_vectors()
-                    results.fail("Atomic expansion failure handling", "expand unexpectedly succeeded")
-                except RuntimeError:
-                    persisted = np.load(str(storage.episodic_vec_path), mmap_mode='r')
-                    active_ok = (
-                        persisted.shape == (2, EMBEDDING_DIM)
-                        and np.allclose(persisted[0], ep_vec)
-                    )
-                    if active_ok:
-                        results.ok("Failed vector expansion leaves active file intact")
-                    else:
-                        results.fail(
-                            "Atomic expansion failure handling",
-                            f"active file changed to shape={persisted.shape}",
-                        )
-                    del persisted
-        finally:
-            persistence_module.np.save = original_np_save
-            shutil.rmtree(failure_dir, ignore_errors=True)
-
-        # Vec_index uniqueness (the critical bug that was fixed)
-        with StorageEngine(tmp_dir) as storage:
-            for i in range(20):
-                storage.store_episode(f"episode {i}", random_vec(), importance=0.5)
-            
-            # Mark some as consolidated
-            storage.mark_episodes_consolidated([1, 2, 3, 4, 5])
-            
-            # Store more after consolidation
-            for i in range(10):
-                storage.store_episode(f"post-consolidation {i}", random_vec(), importance=0.5)
-            
-            # Check for vec_index collisions
-            all_eps = storage.get_all_episodes(consolidated=None)
-            vec_indices = [e['vec_index'] for e in all_eps]
-            unique_indices = set(vec_indices)
-            
-            if len(vec_indices) == len(unique_indices):
-                results.ok(f"No vec_index collisions ({len(vec_indices)} episodes, all unique)")
-            else:
-                from collections import Counter
-                dupes = [(idx, cnt) for idx, cnt in Counter(vec_indices).items() if cnt > 1]
-                results.fail("Vec_index collision", f"{len(dupes)} collisions found: {dupes[:3]}")
+            shutil.rmtree(persist_vec_dir, ignore_errors=True)
 
         # Storage size check
         with StorageEngine(tmp_dir) as storage:

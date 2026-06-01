@@ -1,46 +1,45 @@
 """
 ARN v9 Persistence Layer
 =========================
-SQLite for metadata + memory-mapped NumPy arrays for vectors.
-
-Design choices:
-- SQLite WAL mode for crash safety and concurrent reads
-- Memory-mapped vectors for zero-copy access (OS handles paging)
-- Atomic writes via temp-file-then-rename for vector files
-- Batch operations to minimize SD card wear
+SQLite for metadata + sqlite-vec (vec0) for vectors + FTS5 for full-text search.
 
 Storage layout:
   {data_dir}/
-    arn_metadata.db          # SQLite: all metadata
-    episodic_vectors.npy     # memmap: N x 384 float32
-    semantic_vectors.npy     # memmap: M x 384 float32
+    arn_metadata.db          # SQLite: all metadata, vectors (vec0), full-text (FTS5)
 """
 
 import sqlite3
 import numpy as np
 import os
-import shutil
 import json
 import time
 import hashlib
 import logging
 import threading
-import tempfile
 from typing import Optional, List, Dict, Tuple, Any
 from pathlib import Path
 
+try:
+    import sqlite_vec
+    _SQLITE_VEC_AVAILABLE = True
+except ImportError:
+    _SQLITE_VEC_AVAILABLE = False
+
+from ..core.embeddings import EMBEDDING_DIM
+
+logger = logging.getLogger("arn.storage")
+
+SCHEMA_VERSION = 5
+
 
 class _ThreadLocalConnection:
-    """Thread-local SQLite connection wrapper.
-    
-    SQLite connections cannot be shared across threads safely.
-    Each thread gets its own connection to the same database.
-    """
+    """Thread-local SQLite connection wrapper."""
+
     def __init__(self, db_path: Path, row_factory=sqlite3.Row):
         self.db_path = db_path
         self.row_factory = row_factory
         self._local = threading.local()
-    
+
     def get(self) -> sqlite3.Connection:
         conn = getattr(self._local, 'conn', None)
         if conn is None:
@@ -53,6 +52,14 @@ class _ThreadLocalConnection:
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute("PRAGMA cache_size=2000")
             conn.row_factory = self.row_factory
+            # Load sqlite-vec extension per-connection (extensions are connection-local)
+            if _SQLITE_VEC_AVAILABLE:
+                try:
+                    conn.enable_load_extension(True)
+                    sqlite_vec.load(conn)
+                    conn.enable_load_extension(False)
+                except Exception as e:
+                    logger.warning(f"sqlite-vec load failed: {e}")
             self._local.conn = conn
         return conn
 
@@ -67,118 +74,58 @@ class _ThreadLocalConnection:
             conn.close()
             self._local.conn = None
 
-from ..core.embeddings import EMBEDDING_DIM
-
-logger = logging.getLogger("arn.storage")
-
-# Schema version for migrations
-SCHEMA_VERSION = 4
-
 
 class StorageEngine:
     """
     Persistent storage backend for ARN v9.
-    
-    Handles:
-    - Episode metadata and vectors
-    - Semantic memory metadata and vectors  
-    - System configuration and stats
-    - Crash-safe writes with WAL mode
+
+    Uses sqlite-vec (vec0) for vector storage and KNN search,
+    and FTS5 for full-text keyword search.
     """
-    
+
     def __init__(self, data_dir: str, max_episodes: int = 4096,
                  max_semantics: int = 2048, embedding_dim: int = None):
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        
+
         self.db_path = self.data_dir / "arn_metadata.db"
-        self.episodic_vec_path = self.data_dir / "episodic_vectors.npy"
-        self.semantic_vec_path = self.data_dir / "semantic_vectors.npy"
-        
         self.max_episodes = max_episodes
         self.max_semantics = max_semantics
-        
-        # Dimension handling: use provided, else default to legacy constant.
-        # If existing vector files exist with a different dim, respect THAT.
-        if embedding_dim is None:
-            embedding_dim = EMBEDDING_DIM
-        
-        # If vectors already exist on disk, infer the dim from them
-        # to preserve backward compatibility with existing deployments.
-        if self.episodic_vec_path.exists():
-            try:
-                existing = np.load(str(self.episodic_vec_path), mmap_mode='r')
-                if existing.ndim != 2:
-                    raise ValueError(f"expected 2D vector store, got shape={existing.shape}")
-                existing_dim = existing.shape[1]
-                if existing_dim != embedding_dim:
-                    logger.warning(
-                        f"Existing vectors have dim={existing_dim} but engine "
-                        f"configured for dim={embedding_dim}. Using existing dim "
-                        f"to preserve data. Delete the data directory to switch models."
-                    )
-                    embedding_dim = existing_dim
-                del existing  # Close the mmap before reopening below
-            except Exception as exc:
-                logger.warning(
-                    "Could not inspect existing episodic vectors; startup will "
-                    f"attempt recovery with default dim={embedding_dim}: {exc}"
-                )
-        
-        self.embedding_dim = embedding_dim
+        self.embedding_dim = embedding_dim if embedding_dim is not None else EMBEDDING_DIM
 
-        # Initialize database
         self._conn = _ThreadLocalConnection(self.db_path, row_factory=sqlite3.Row)
-        self._init_db()
-
-        # Initialize vector stores
-        self._episodic_vectors: Optional[np.ndarray] = None
-        self._semantic_vectors: Optional[np.ndarray] = None
-        self._init_vectors()
-
-        # Write buffer for batched operations
-        self._pending_episode_writes: List[Tuple[int, np.ndarray]] = []
-        self._pending_semantic_writes: List[Tuple[int, np.ndarray]] = []
         self._lock = threading.Lock()
-
-        # Optional sqlite-vec accelerator for fast ANN search
-        try:
-            from arn_v9.storage.vec_accelerator import VecAccelerator
-            self._vec_acc = VecAccelerator(self.data_dir, self.embedding_dim)
-            if self._vec_acc.available:
-                synced = self._vec_acc.sync_from_storage(self)
-                logger.info(f"[storage] sqlite-vec accelerator ready ({synced} vectors synced)")
-        except Exception as _vec_exc:
-            logger.debug(f"[storage] sqlite-vec accelerator skipped: {_vec_exc}")
-            self._vec_acc = None
+        self._init_db()
 
     def _get_conn(self) -> sqlite3.Connection:
         return self._conn.get()
-    
+
+    # =========================================================
+    # SCHEMA INIT + MIGRATION
+    # =========================================================
+
     def _init_db(self):
-        """Create tables if they don't exist, migrate if needed."""
+        """Create tables if they don't exist; run migrations if needed."""
         conn = self._get_conn()
-        
-        # Create schema_version table first (needed to check version)
+
         conn.execute("""
-            CREATE TABLE IF NOT EXISTS schema_version (
-                version INTEGER PRIMARY KEY
-            )
+            CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)
         """)
         conn.commit()
-        
-        # Check and run migrations BEFORE creating tables with new columns
+
         existing = conn.execute("SELECT version FROM schema_version").fetchone()
-        if existing is not None and existing[0] < SCHEMA_VERSION:
-            self._migrate_schema(conn, existing[0])
+        current_ver = existing[0] if existing is not None else None
+
+        if current_ver is not None and current_ver < SCHEMA_VERSION:
+            self._migrate_schema(conn, current_ver)
             conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION,))
             conn.commit()
-        
-        # Now create all tables (safe for both fresh installs and migrated dbs)
-        conn.executescript("""
+
+        # Core tables (safe for both fresh and migrated dbs)
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS episodes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                vec_index INTEGER NOT NULL,
+                vec_index INTEGER DEFAULT -1,
                 content TEXT NOT NULL,
                 content_hash TEXT,
                 context_json TEXT DEFAULT '{}',
@@ -195,11 +142,12 @@ class StorageEngine:
                 invalidated_at REAL,
                 user_id TEXT,
                 memory_type TEXT DEFAULT 'episode'
-            );
-            
+            )
+        """)
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS semantic_nodes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                vec_index INTEGER NOT NULL,
+                vec_index INTEGER DEFAULT -1,
                 concept_label TEXT NOT NULL,
                 confidence REAL DEFAULT 0.1,
                 evidence_count INTEGER DEFAULT 0,
@@ -208,30 +156,15 @@ class StorageEngine:
                 created_at REAL NOT NULL,
                 last_updated REAL NOT NULL,
                 access_count INTEGER DEFAULT 0
-            );
-            
+            )
+        """)
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS system_state (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
-            );
-            
-            CREATE INDEX IF NOT EXISTS idx_episodes_importance 
-                ON episodes(importance DESC);
-            CREATE INDEX IF NOT EXISTS idx_episodes_created 
-                ON episodes(created_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_episodes_consolidated 
-                ON episodes(consolidated);
-            CREATE INDEX IF NOT EXISTS idx_episodes_hash
-                ON episodes(content_hash);
-            CREATE INDEX IF NOT EXISTS idx_episodes_expires
-                ON episodes(expires_at);
-            CREATE INDEX IF NOT EXISTS idx_episodes_user
-                ON episodes(user_id);
-            CREATE INDEX IF NOT EXISTS idx_episodes_memory_type
-                ON episodes(memory_type);
-            CREATE INDEX IF NOT EXISTS idx_semantic_confidence 
-                ON semantic_nodes(confidence DESC);
-            
+            )
+        """)
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS memory_links (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 from_episode_id INTEGER NOT NULL,
@@ -242,66 +175,107 @@ class StorageEngine:
                 FOREIGN KEY (from_episode_id) REFERENCES episodes(id),
                 FOREIGN KEY (to_episode_id) REFERENCES episodes(id),
                 UNIQUE (from_episode_id, to_episode_id, relation_type)
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_links_from
-                ON memory_links(from_episode_id);
-            CREATE INDEX IF NOT EXISTS idx_links_to
-                ON memory_links(to_episode_id);
+            )
         """)
-        
-        # Set schema version for fresh installs
-        existing = conn.execute("SELECT version FROM schema_version").fetchone()
-        if existing is None:
+
+        for idx_sql in [
+            "CREATE INDEX IF NOT EXISTS idx_episodes_importance ON episodes(importance DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_episodes_created ON episodes(created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_episodes_consolidated ON episodes(consolidated)",
+            "CREATE INDEX IF NOT EXISTS idx_episodes_hash ON episodes(content_hash)",
+            "CREATE INDEX IF NOT EXISTS idx_episodes_expires ON episodes(expires_at)",
+            "CREATE INDEX IF NOT EXISTS idx_episodes_user ON episodes(user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_episodes_memory_type ON episodes(memory_type)",
+            "CREATE INDEX IF NOT EXISTS idx_semantic_confidence ON semantic_nodes(confidence DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_links_from ON memory_links(from_episode_id)",
+            "CREATE INDEX IF NOT EXISTS idx_links_to ON memory_links(to_episode_id)",
+        ]:
+            conn.execute(idx_sql)
+
+        # sqlite-vec virtual tables
+        dim = self.embedding_dim
+        conn.execute(
+            f"CREATE VIRTUAL TABLE IF NOT EXISTS episode_embeddings "
+            f"USING vec0(embedding float[{dim}])"
+        )
+        conn.execute(
+            f"CREATE VIRTUAL TABLE IF NOT EXISTS semantic_embeddings "
+            f"USING vec0(embedding float[{dim}])"
+        )
+
+        # FTS5 full-text index
+        conn.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS episodes_fts
+            USING fts5(content, content='episodes', content_rowid='id',
+                       tokenize='porter ascii')
+        """)
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS episodes_fts_insert
+            AFTER INSERT ON episodes BEGIN
+                INSERT INTO episodes_fts(rowid, content) VALUES (new.id, new.content);
+            END
+        """)
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS episodes_fts_delete
+            AFTER DELETE ON episodes BEGIN
+                INSERT INTO episodes_fts(episodes_fts, rowid, content)
+                VALUES ('delete', old.id, old.content);
+            END
+        """)
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS episodes_fts_update
+            AFTER UPDATE OF content ON episodes BEGIN
+                INSERT INTO episodes_fts(episodes_fts, rowid, content)
+                VALUES ('delete', old.id, old.content);
+                INSERT INTO episodes_fts(rowid, content) VALUES (new.id, new.content);
+            END
+        """)
+
+        # Fresh install: set schema version
+        if current_ver is None:
             conn.execute("INSERT INTO schema_version VALUES (?)", (SCHEMA_VERSION,))
-        
+
         conn.commit()
-    
-    def _migrate_schema(self, conn, from_version: int):
-        """Migrate database schema from older versions."""
+
+    def _migrate_schema(self, conn: sqlite3.Connection, from_version: int):
+        """Run migrations from from_version up to SCHEMA_VERSION."""
         if from_version < 2:
-            # v1 → v2: add new columns to episodes, create entities tables
-            migrations = [
+            for sql in [
                 "ALTER TABLE episodes ADD COLUMN content_hash TEXT",
                 "ALTER TABLE episodes ADD COLUMN expires_at REAL",
                 "ALTER TABLE episodes ADD COLUMN superseded_by INTEGER",
                 "ALTER TABLE episodes ADD COLUMN invalidated_at REAL",
                 "ALTER TABLE episodes ADD COLUMN user_id TEXT",
-            ]
-            for sql in migrations:
+            ]:
                 try:
                     conn.execute(sql)
                 except Exception:
-                    pass  # Column may already exist
-            
-            # Backfill content_hash for existing episodes
-            rows = conn.execute("SELECT id, content FROM episodes WHERE content_hash IS NULL").fetchall()
+                    pass
+            rows = conn.execute(
+                "SELECT id, content FROM episodes WHERE content_hash IS NULL"
+            ).fetchall()
             for row in rows:
-                normalized = ' '.join(row['content'].lower().split())
-                h = hashlib.sha256(normalized.encode()).hexdigest()[:16]
-                conn.execute("UPDATE episodes SET content_hash = ? WHERE id = ?", (h, row['id']))
-            
-            # Create indexes for new columns
+                h = hashlib.sha256(' '.join(row[1].lower().split()).encode()).hexdigest()[:16]
+                conn.execute("UPDATE episodes SET content_hash=? WHERE id=?", (h, row[0]))
             for idx_sql in [
                 "CREATE INDEX IF NOT EXISTS idx_episodes_hash ON episodes(content_hash)",
                 "CREATE INDEX IF NOT EXISTS idx_episodes_expires ON episodes(expires_at)",
                 "CREATE INDEX IF NOT EXISTS idx_episodes_user ON episodes(user_id)",
             ]:
                 conn.execute(idx_sql)
-            
             logger.info(f"Migrated schema v1 → v2 ({len(rows)} episodes hash-backfilled)")
-        
+
         if from_version < 3:
-            # v2 → v3: add memory_type column for typed retrieval
             try:
                 conn.execute("ALTER TABLE episodes ADD COLUMN memory_type TEXT DEFAULT 'episode'")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_episodes_memory_type ON episodes(memory_type)")
-                logger.info("Migrated schema v2 → v3 (memory_type column added)")
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_episodes_memory_type ON episodes(memory_type)"
+                )
+                logger.info("Migrated schema v2 → v3 (memory_type)")
             except Exception:
-                pass  # Column may already exist
+                pass
 
         if from_version < 4:
-            # v3 → v4: add memory_links table for manual graph wiring
             try:
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS memory_links (
@@ -316,118 +290,113 @@ class StorageEngine:
                         UNIQUE (from_episode_id, to_episode_id, relation_type)
                     )
                 """)
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_links_from ON memory_links(from_episode_id)")
-                conn.execute("CREATE INDEX IF NOT EXISTS idx_links_to ON memory_links(to_episode_id)")
-                logger.info("Migrated schema v3 → v4 (memory_links table added)")
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_links_from ON memory_links(from_episode_id)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_links_to ON memory_links(to_episode_id)"
+                )
+                logger.info("Migrated schema v3 → v4 (memory_links)")
             except Exception:
                 pass
-    
-    def _init_vectors(self):
-        """Initialize or load memory-mapped vector files."""
-        self._episodic_vectors = self._load_or_create_vectors(
-            self.episodic_vec_path, self.max_episodes, "episodic", "episodes"
+
+        if from_version < 5:
+            self._migrate_v4_to_v5(conn)
+
+        conn.commit()
+
+    def _migrate_v4_to_v5(self, conn: sqlite3.Connection):
+        """v4 → v5: Replace memmap vectors with sqlite-vec; add FTS5."""
+        dim = self.embedding_dim
+
+        conn.execute(
+            f"CREATE VIRTUAL TABLE IF NOT EXISTS episode_embeddings "
+            f"USING vec0(embedding float[{dim}])"
         )
-        self._semantic_vectors = self._load_or_create_vectors(
-            self.semantic_vec_path, self.max_semantics, "semantic", "semantic_nodes"
+        conn.execute(
+            f"CREATE VIRTUAL TABLE IF NOT EXISTS semantic_embeddings "
+            f"USING vec0(embedding float[{dim}])"
         )
 
-    def _load_or_create_vectors(self, path: Path, capacity: int, label: str,
-                                table: str = None) -> np.ndarray:
-        """Load a memmap vector store, replacing corrupt files with a fresh store."""
-        if path.exists():
+        # Migrate episodic memmap vectors
+        ep_vec_path = self.data_dir / "episodic_vectors.npy"
+        if ep_vec_path.exists():
             try:
-                vectors = np.load(str(path), mmap_mode='r+')
-                self._validate_vector_store(vectors, label)
-                logger.info(f"Loaded {label} vectors: {vectors.shape}")
-                return vectors
-            except Exception as exc:
-                corrupt_path = self._quarantine_vector_file(path)
-                affected_msg = ""
-                if table:
-                    try:
-                        count = self._get_conn().execute(
-                            f"SELECT COUNT(*) FROM {table}"
-                        ).fetchone()[0]
-                        affected_msg = (
-                            f" {count} existing rows will have zero vectors "
-                            "until re-embedded."
-                        )
-                    except Exception:
-                        pass
-                logger.warning(
-                    f"Could not load {label} vectors from {path}: {exc}. "
-                    f"Moved corrupt file to {corrupt_path} and creating a fresh "
-                    f"store.{affected_msg}"
-                )
+                old_vecs = np.load(str(ep_vec_path))
+                rows = conn.execute("SELECT id, vec_index FROM episodes").fetchall()
+                migrated = 0
+                for row in rows:
+                    ep_id, vi = row[0], row[1]
+                    if vi is not None and 0 <= vi < old_vecs.shape[0]:
+                        vec = old_vecs[vi].astype(np.float32)
+                        if np.any(vec != 0) and vec.shape[0] == dim:
+                            conn.execute(
+                                "INSERT OR REPLACE INTO episode_embeddings(rowid, embedding) VALUES (?, ?)",
+                                (ep_id, vec.tobytes())
+                            )
+                            migrated += 1
+                logger.info(f"Migrated {migrated} episode vectors to sqlite-vec")
+            except Exception as e:
+                logger.warning(f"Could not migrate episode vectors: {e}")
 
-        vectors = np.zeros((capacity, self.embedding_dim), dtype=np.float32)
-        np.save(str(path), vectors)
-        return np.load(str(path), mmap_mode='r+')
+        sem_vec_path = self.data_dir / "semantic_vectors.npy"
+        if sem_vec_path.exists():
+            try:
+                old_vecs = np.load(str(sem_vec_path))
+                rows = conn.execute("SELECT id, vec_index FROM semantic_nodes").fetchall()
+                migrated = 0
+                for row in rows:
+                    sem_id, vi = row[0], row[1]
+                    if vi is not None and 0 <= vi < old_vecs.shape[0]:
+                        vec = old_vecs[vi].astype(np.float32)
+                        if np.any(vec != 0) and vec.shape[0] == dim:
+                            conn.execute(
+                                "INSERT OR REPLACE INTO semantic_embeddings(rowid, embedding) VALUES (?, ?)",
+                                (sem_id, vec.tobytes())
+                            )
+                            migrated += 1
+                logger.info(f"Migrated {migrated} semantic vectors to sqlite-vec")
+            except Exception as e:
+                logger.warning(f"Could not migrate semantic vectors: {e}")
 
-    def _atomic_save_vectors(self, path: Path, vectors: np.ndarray):
-        """Persist a vector store by replacing the active .npy atomically."""
-        temp_path = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode='wb',
-                dir=str(path.parent),
-                prefix=f".{path.name}.",
-                suffix=".tmp",
-                delete=False,
-            ) as temp_file:
-                temp_path = Path(temp_file.name)
-                np.save(temp_file, vectors)
-                temp_file.flush()
-                os.fsync(temp_file.fileno())
+        # FTS5 virtual table
+        conn.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS episodes_fts
+            USING fts5(content, content='episodes', content_rowid='id',
+                       tokenize='porter ascii')
+        """)
+        conn.execute(
+            "INSERT INTO episodes_fts(rowid, content) SELECT id, content FROM episodes"
+        )
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS episodes_fts_insert
+            AFTER INSERT ON episodes BEGIN
+                INSERT INTO episodes_fts(rowid, content) VALUES (new.id, new.content);
+            END
+        """)
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS episodes_fts_delete
+            AFTER DELETE ON episodes BEGIN
+                INSERT INTO episodes_fts(episodes_fts, rowid, content)
+                VALUES ('delete', old.id, old.content);
+            END
+        """)
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS episodes_fts_update
+            AFTER UPDATE OF content ON episodes BEGIN
+                INSERT INTO episodes_fts(episodes_fts, rowid, content)
+                VALUES ('delete', old.id, old.content);
+                INSERT INTO episodes_fts(rowid, content) VALUES (new.id, new.content);
+            END
+        """)
 
-            os.replace(str(temp_path), str(path))
-            temp_path = None
-            self._fsync_directory(path.parent)
-        finally:
-            if temp_path is not None:
-                try:
-                    temp_path.unlink()
-                except FileNotFoundError:
-                    pass
+        conn.commit()
+        logger.info("Migrated schema v4 → v5 (sqlite-vec + FTS5)")
 
-    def _fsync_directory(self, path: Path):
-        """Best-effort directory fsync so atomic replaces survive power loss."""
-        try:
-            dir_fd = os.open(str(path), os.O_RDONLY)
-        except OSError:
-            return
-        try:
-            os.fsync(dir_fd)
-        except OSError:
-            pass
-        finally:
-            os.close(dir_fd)
-
-    def _validate_vector_store(self, vectors: np.ndarray, label: str):
-        if vectors.ndim != 2:
-            raise ValueError(f"{label} vector store must be 2D, got shape={vectors.shape}")
-        if vectors.shape[1] != self.embedding_dim:
-            raise ValueError(
-                f"{label} vector dim={vectors.shape[1]} does not match "
-                f"configured dim={self.embedding_dim}"
-            )
-        if vectors.dtype != np.float32:
-            raise ValueError(f"{label} vector dtype must be float32, got {vectors.dtype}")
-
-    def _quarantine_vector_file(self, path: Path) -> Path:
-        suffix = f"{path.suffix}.corrupt-{int(time.time())}"
-        corrupt_path = path.with_suffix(suffix)
-        counter = 1
-        while corrupt_path.exists():
-            corrupt_path = path.with_suffix(f"{suffix}-{counter}")
-            counter += 1
-        path.replace(corrupt_path)
-        return corrupt_path
-    
     # =========================================================
     # EPISODIC MEMORY OPERATIONS
     # =========================================================
-    
+
     def store_episode(self, content: str, vector: np.ndarray,
                       context: dict = None, importance: float = 0.5,
                       prediction_error: float = 0.0,
@@ -439,218 +408,231 @@ class StorageEngine:
         with self._lock:
             conn = self._get_conn()
             now = time.time()
-            
-            # Content hash for deduplication
             normalized = ' '.join(content.lower().split())
             c_hash = hashlib.sha256(normalized.encode()).hexdigest()[:16]
-            
-            # Find next available vector index
-            # CRITICAL: Use MAX(vec_index)+1, NOT COUNT(*).
-            # COUNT-based allocation causes collisions when episodes are
-            # consolidated or deleted — new episodes get indices that
-            # already belong to other episodes, overwriting their vectors.
-            row = conn.execute("SELECT MAX(vec_index) FROM episodes").fetchone()
-            vec_index = (row[0] + 1) if row[0] is not None else 0
-            
-            # Handle overflow
-            if vec_index >= self.max_episodes:
-                vec_index = self._find_free_episode_slot(conn)
-            
-            # Store vector
-            if vec_index < self._episodic_vectors.shape[0]:
-                self._episodic_vectors[vec_index] = vector
-            else:
-                logger.warning(f"Vector index {vec_index} out of bounds, expanding")
-                self._expand_episodic_vectors()
-                self._episodic_vectors[vec_index] = vector
-            
-            # Store metadata
+
             cursor = conn.execute("""
-                INSERT INTO episodes (vec_index, content, content_hash, context_json, 
-                                      importance, prediction_error, created_at, source,
-                                      expires_at, user_id, memory_type)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO episodes
+                    (vec_index, content, content_hash, context_json,
+                     importance, prediction_error, created_at, source,
+                     expires_at, user_id, memory_type)
+                VALUES (-1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                vec_index,
-                content,
-                c_hash,
-                json.dumps(context or {}),
-                importance,
-                prediction_error,
-                now,
-                source,
-                expires_at,
-                user_id,
-                memory_type,
+                content, c_hash, json.dumps(context or {}),
+                importance, prediction_error, now, source,
+                expires_at, user_id, memory_type,
             ))
-            
-            conn.commit()
             ep_id = cursor.lastrowid
 
-            # Sync new episode to sqlite-vec accelerator (best-effort)
-            if self._vec_acc and self._vec_acc.available:
-                self._vec_acc.upsert(ep_id, vector)
-
+            # Store vector in sqlite-vec
+            conn.execute(
+                "INSERT OR REPLACE INTO episode_embeddings(rowid, embedding) VALUES (?, ?)",
+                (ep_id, vector.astype(np.float32).tobytes())
+            )
+            conn.commit()
             return ep_id
 
     def get_episode(self, episode_id: int) -> Optional[dict]:
-        """Retrieve episode by ID."""
         conn = self._get_conn()
         row = conn.execute(
             "SELECT * FROM episodes WHERE id = ?", (episode_id,)
         ).fetchone()
-        if row is None:
-            return None
-        return self._row_to_episode(row)
-    
+        return self._row_to_episode(row) if row else None
+
+    def get_episodes_by_ids(self, episode_ids: List[int]) -> List[dict]:
+        if not episode_ids:
+            return []
+        conn = self._get_conn()
+        placeholders = ','.join('?' * len(episode_ids))
+        rows = conn.execute(
+            f"SELECT * FROM episodes WHERE id IN ({placeholders})", episode_ids
+        ).fetchall()
+        return [self._row_to_episode(r) for r in rows]
+
     def get_all_episodes(self, consolidated: Optional[bool] = None,
                          limit: int = None,
                          memory_type: Optional[str] = None) -> List[dict]:
-        """Retrieve episodes with optional filtering."""
         conn = self._get_conn()
-        query = "SELECT * FROM episodes"
-        params = []
         conditions = []
-        
+        params = []
+
         if consolidated is not None:
             conditions.append("consolidated = ?")
             params.append(int(consolidated))
-        
         if memory_type is not None:
             conditions.append("memory_type = ?")
             params.append(memory_type)
-        
+
+        query = "SELECT * FROM episodes"
         if conditions:
             query += " WHERE " + " AND ".join(conditions)
-        
         query += " ORDER BY created_at DESC"
-        
         if limit:
             query += " LIMIT ?"
             params.append(limit)
-        
+
         rows = conn.execute(query, params).fetchall()
         return [self._row_to_episode(r) for r in rows]
-    
+
     def get_episode_vectors(self, episode_ids: List[int] = None) -> Tuple[np.ndarray, List[int]]:
-        """
-        Get vectors for episodes. Returns (vectors_matrix, vec_indices).
-        If episode_ids is None, returns all unconsolidated episode vectors.
-        """
+        """Get vectors for episodes. Returns (matrix, ids)."""
         conn = self._get_conn()
-        
+
         if episode_ids is None:
             rows = conn.execute(
-                "SELECT id, vec_index FROM episodes WHERE consolidated=0"
+                "SELECT id FROM episodes WHERE consolidated=0"
             ).fetchall()
-        else:
-            placeholders = ','.join('?' * len(episode_ids))
-            rows = conn.execute(
-                f"SELECT id, vec_index FROM episodes WHERE id IN ({placeholders})",
-                episode_ids
-            ).fetchall()
-        
+            episode_ids = [r[0] for r in rows]
+
+        if not episode_ids:
+            return np.zeros((0, self.embedding_dim), dtype=np.float32), []
+
+        placeholders = ','.join('?' * len(episode_ids))
+        rows = conn.execute(
+            f"SELECT rowid, embedding FROM episode_embeddings WHERE rowid IN ({placeholders})",
+            episode_ids
+        ).fetchall()
+
         if not rows:
             return np.zeros((0, self.embedding_dim), dtype=np.float32), []
-        
-        indices = [r['vec_index'] for r in rows]
-        ids = [r['id'] for r in rows]
-        vectors = self._episodic_vectors[indices].copy()
-        return vectors, ids
-    
+
+        ids = []
+        vectors = []
+        for row in rows:
+            eid = row[0]
+            vec = np.frombuffer(row[1], dtype=np.float32).copy()
+            if vec.shape[0] == self.embedding_dim:
+                ids.append(eid)
+                vectors.append(vec)
+
+        if not vectors:
+            return np.zeros((0, self.embedding_dim), dtype=np.float32), []
+
+        return np.array(vectors, dtype=np.float32), ids
+
+    def knn_search(self, query_vector: np.ndarray, top_k: int = 20) -> List[Tuple[int, float]]:
+        """KNN search via sqlite-vec. Returns [(episode_id, score), ...] sorted by score desc."""
+        conn = self._get_conn()
+        blob = query_vector.astype(np.float32).tobytes()
+        try:
+            rows = conn.execute(
+                "SELECT rowid, distance FROM episode_embeddings "
+                "WHERE embedding MATCH ? AND k=?",
+                (blob, top_k)
+            ).fetchall()
+            # L2 distance → similarity score: 1/(1+d), higher is better
+            return [(r[0], 1.0 / (1.0 + float(r[1]))) for r in rows]
+        except Exception as e:
+            logger.debug(f"knn_search failed: {e}")
+            return []
+
+    def fts_search(self, query: str, top_k: int = 20) -> List[Tuple[int, float]]:
+        """FTS5 full-text search. Returns [(episode_id, score), ...] sorted by score desc."""
+        conn = self._get_conn()
+        # Sanitize query: keep only words of length ≥ 2, no FTS5 special chars
+        clean_words = [
+            w for w in query.split()
+            if len(w) >= 2 and not any(c in w for c in '"-*:^()')
+        ]
+        if not clean_words:
+            return []
+        fts_query = ' '.join(clean_words)
+        try:
+            rows = conn.execute(
+                "SELECT rowid, rank FROM episodes_fts WHERE episodes_fts MATCH ? "
+                "ORDER BY rank LIMIT ?",
+                (fts_query, top_k)
+            ).fetchall()
+        except Exception as e:
+            logger.debug(f"fts_search failed for query '{fts_query}': {e}")
+            return []
+
+        if not rows:
+            return []
+
+        # FTS5 rank is negative BM25; flip and normalize 0→1
+        results = [(r[0], float(-r[1])) for r in rows]
+        max_s = max(s for _, s in results)
+        if max_s <= 0:
+            return results
+        return [(eid, s / max_s) for eid, s in results]
+
     def update_episode_access(self, episode_id: int):
-        """Increment access count and update last_accessed."""
         conn = self._get_conn()
-        conn.execute("""
-            UPDATE episodes 
-            SET access_count = access_count + 1, last_accessed = ?
-            WHERE id = ?
-        """, (time.time(), episode_id))
+        conn.execute(
+            "UPDATE episodes SET access_count=access_count+1, last_accessed=? WHERE id=?",
+            (time.time(), episode_id)
+        )
         conn.commit()
-    
+
     def mark_episodes_consolidated(self, episode_ids: List[int]):
-        """Mark episodes as consolidated."""
         conn = self._get_conn()
         placeholders = ','.join('?' * len(episode_ids))
         conn.execute(
-            f"UPDATE episodes SET consolidated = 1 WHERE id IN ({placeholders})",
+            f"UPDATE episodes SET consolidated=1 WHERE id IN ({placeholders})",
             episode_ids
         )
         conn.commit()
-    
+
     def delete_episodes(self, episode_ids: List[int]):
-        """Delete episodes permanently."""
         conn = self._get_conn()
         placeholders = ','.join('?' * len(episode_ids))
+        for eid in episode_ids:
+            try:
+                conn.execute("DELETE FROM episode_embeddings WHERE rowid=?", (eid,))
+            except Exception:
+                pass
         conn.execute(
-            f"DELETE FROM episodes WHERE id IN ({placeholders})",
-            episode_ids
+            f"DELETE FROM episodes WHERE id IN ({placeholders})", episode_ids
         )
         conn.commit()
-        # Sync deletions to sqlite-vec accelerator (best-effort)
-        if self._vec_acc and self._vec_acc.available:
-            for ep_id in episode_ids:
-                self._vec_acc.delete(ep_id)
-    
+
     def count_episodes(self, consolidated: Optional[bool] = None) -> int:
         conn = self._get_conn()
         if consolidated is None:
             return conn.execute("SELECT COUNT(*) FROM episodes").fetchone()[0]
         return conn.execute(
-            "SELECT COUNT(*) FROM episodes WHERE consolidated=?",
-            (int(consolidated),)
+            "SELECT COUNT(*) FROM episodes WHERE consolidated=?", (int(consolidated),)
         ).fetchone()[0]
-    
+
     # =========================================================
     # SEMANTIC MEMORY OPERATIONS
     # =========================================================
-    
+
     def store_semantic(self, concept_label: str, vector: np.ndarray,
                        confidence: float = 0.1, evidence_count: int = 1,
                        schema: dict = None) -> int:
-        """Store a new semantic memory node. Returns node ID."""
         with self._lock:
             conn = self._get_conn()
             now = time.time()
-
-            # Use MAX(vec_index)+1, not COUNT(*). COUNT causes collisions when
-            # nodes are deleted — new entries get indices already owned by others.
-            row = conn.execute("SELECT MAX(vec_index) FROM semantic_nodes").fetchone()
-            vec_index = (row[0] + 1) if row[0] is not None else 0
-
-            if vec_index >= self._semantic_vectors.shape[0]:
-                self._expand_semantic_vectors()
-
-            self._semantic_vectors[vec_index] = vector
-
             cursor = conn.execute("""
-                INSERT INTO semantic_nodes (vec_index, concept_label, confidence,
-                                           evidence_count, schema_json, created_at, last_updated)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (
-                vec_index, concept_label, confidence,
-                evidence_count, json.dumps(schema or {}), now, now
-            ))
-
+                INSERT INTO semantic_nodes
+                    (vec_index, concept_label, confidence, evidence_count,
+                     schema_json, created_at, last_updated)
+                VALUES (-1, ?, ?, ?, ?, ?, ?)
+            """, (concept_label, confidence, evidence_count,
+                  json.dumps(schema or {}), now, now))
+            sem_id = cursor.lastrowid
+            conn.execute(
+                "INSERT OR REPLACE INTO semantic_embeddings(rowid, embedding) VALUES (?, ?)",
+                (sem_id, vector.astype(np.float32).tobytes())
+            )
             conn.commit()
-            return cursor.lastrowid
-    
+            return sem_id
+
     def update_semantic(self, node_id: int, vector: np.ndarray = None,
                         confidence: float = None, evidence_count: int = None,
                         contradiction_log: list = None, schema: dict = None):
-        """Update an existing semantic node."""
         conn = self._get_conn()
-        
+
         if vector is not None:
-            row = conn.execute(
-                "SELECT vec_index FROM semantic_nodes WHERE id=?", (node_id,)
-            ).fetchone()
-            if row:
-                self._semantic_vectors[row['vec_index']] = vector
-        
+            conn.execute(
+                "INSERT OR REPLACE INTO semantic_embeddings(rowid, embedding) VALUES (?, ?)",
+                (node_id, vector.astype(np.float32).tobytes())
+            )
+
         updates = []
         params = []
-        
         if confidence is not None:
             updates.append("confidence = ?")
             params.append(confidence)
@@ -663,81 +645,84 @@ class StorageEngine:
         if schema is not None:
             updates.append("schema_json = ?")
             params.append(json.dumps(schema))
-        
         updates.append("last_updated = ?")
         params.append(time.time())
         params.append(node_id)
-        
+
         conn.execute(
-            f"UPDATE semantic_nodes SET {', '.join(updates)} WHERE id = ?",
-            params
+            f"UPDATE semantic_nodes SET {', '.join(updates)} WHERE id = ?", params
         )
         conn.commit()
-    
+
     def get_all_semantics(self) -> List[dict]:
-        """Retrieve all semantic nodes."""
         conn = self._get_conn()
         rows = conn.execute(
             "SELECT * FROM semantic_nodes ORDER BY confidence DESC"
         ).fetchall()
         return [self._row_to_semantic(r) for r in rows]
-    
+
     def get_semantic_vectors(self) -> Tuple[np.ndarray, List[int]]:
-        """Get all semantic vectors. Returns (matrix, node_ids)."""
         conn = self._get_conn()
         rows = conn.execute(
-            "SELECT id, vec_index FROM semantic_nodes"
+            "SELECT rowid, embedding FROM semantic_embeddings"
         ).fetchall()
-        
         if not rows:
             return np.zeros((0, self.embedding_dim), dtype=np.float32), []
-        
-        indices = [r['vec_index'] for r in rows]
-        ids = [r['id'] for r in rows]
-        vectors = self._semantic_vectors[indices].copy()
-        return vectors, ids
-    
+
+        ids = []
+        vectors = []
+        for row in rows:
+            vec = np.frombuffer(row[1], dtype=np.float32).copy()
+            if vec.shape[0] == self.embedding_dim:
+                ids.append(row[0])
+                vectors.append(vec)
+
+        if not vectors:
+            return np.zeros((0, self.embedding_dim), dtype=np.float32), []
+
+        return np.array(vectors, dtype=np.float32), ids
+
     def count_semantics(self) -> int:
-        conn = self._get_conn()
-        return conn.execute("SELECT COUNT(*) FROM semantic_nodes").fetchone()[0]
-    
+        return self._get_conn().execute(
+            "SELECT COUNT(*) FROM semantic_nodes"
+        ).fetchone()[0]
+
     def delete_semantics(self, node_ids: List[int]):
-        """Delete semantic nodes."""
         conn = self._get_conn()
+        for sid in node_ids:
+            try:
+                conn.execute("DELETE FROM semantic_embeddings WHERE rowid=?", (sid,))
+            except Exception:
+                pass
         placeholders = ','.join('?' * len(node_ids))
         conn.execute(
-            f"DELETE FROM semantic_nodes WHERE id IN ({placeholders})",
-            node_ids
+            f"DELETE FROM semantic_nodes WHERE id IN ({placeholders})", node_ids
         )
         conn.commit()
-    
+
     # =========================================================
     # SYSTEM STATE
     # =========================================================
-    
+
     def get_state(self, key: str, default: str = None) -> Optional[str]:
-        conn = self._get_conn()
-        row = conn.execute(
+        row = self._get_conn().execute(
             "SELECT value FROM system_state WHERE key = ?", (key,)
         ).fetchone()
         return row['value'] if row else default
-    
+
     def set_state(self, key: str, value: str):
         conn = self._get_conn()
         conn.execute(
-            "INSERT OR REPLACE INTO system_state (key, value) VALUES (?, ?)",
-            (key, value)
+            "INSERT OR REPLACE INTO system_state (key, value) VALUES (?, ?)", (key, value)
         )
         conn.commit()
-    
+
     # =========================================================
     # MEMORY LINK OPERATIONS
     # =========================================================
 
     def create_link(self, from_id: int, to_id: int,
                     relation_type: str, confidence: float = 1.0) -> int:
-        """Create a directed link between two episodes. Returns link ID.
-        If the link already exists, returns the existing link's ID."""
         conn = self._get_conn()
         now = time.time()
         try:
@@ -756,7 +741,6 @@ class StorageEngine:
             return row['id'] if row else -1
 
     def get_links_for_episode(self, episode_id: int) -> List[dict]:
-        """Return all links where the episode is source or target."""
         conn = self._get_conn()
         rows = conn.execute("""
             SELECT * FROM memory_links
@@ -766,37 +750,26 @@ class StorageEngine:
         return [self._row_to_link(r) for r in rows]
 
     def delete_link(self, link_id: int):
-        """Delete a link by ID."""
         conn = self._get_conn()
         conn.execute("DELETE FROM memory_links WHERE id=?", (link_id,))
         conn.commit()
 
     def get_all_links(self) -> List[dict]:
-        """Return all links for this agent's storage."""
         conn = self._get_conn()
         rows = conn.execute(
             "SELECT * FROM memory_links ORDER BY created_at DESC"
         ).fetchall()
         return [self._row_to_link(r) for r in rows]
 
-    def _row_to_link(self, row) -> dict:
-        return {
-            'id': row['id'],
-            'from_episode_id': row['from_episode_id'],
-            'to_episode_id': row['to_episode_id'],
-            'relation_type': row['relation_type'],
-            'created_at': row['created_at'],
-            'confidence': row['confidence'],
-        }
-
     # =========================================================
     # INTERNAL HELPERS
     # =========================================================
-    
+
     def _row_to_episode(self, row) -> dict:
+        keys = row.keys() if hasattr(row, 'keys') else []
         return {
             'id': row['id'],
-            'vec_index': row['vec_index'],
+            'vec_index': row['vec_index'] if 'vec_index' in keys else -1,
             'content': row['content'],
             'context': json.loads(row['context_json']),
             'importance': row['importance'],
@@ -807,14 +780,14 @@ class StorageEngine:
             'last_accessed': row['last_accessed'],
             'consolidated': bool(row['consolidated']),
             'source': row['source'],
-            'content_hash': row['content_hash'] if 'content_hash' in row.keys() else None,
-            'expires_at': row['expires_at'] if 'expires_at' in row.keys() else None,
-            'superseded_by': row['superseded_by'] if 'superseded_by' in row.keys() else None,
-            'invalidated_at': row['invalidated_at'] if 'invalidated_at' in row.keys() else None,
-            'user_id': row['user_id'] if 'user_id' in row.keys() else None,
-            'memory_type': row['memory_type'] if 'memory_type' in row.keys() else 'episode',
+            'content_hash': row['content_hash'] if 'content_hash' in keys else None,
+            'expires_at': row['expires_at'] if 'expires_at' in keys else None,
+            'superseded_by': row['superseded_by'] if 'superseded_by' in keys else None,
+            'invalidated_at': row['invalidated_at'] if 'invalidated_at' in keys else None,
+            'user_id': row['user_id'] if 'user_id' in keys else None,
+            'memory_type': row['memory_type'] if 'memory_type' in keys else 'episode',
         }
-    
+
     def _row_to_semantic(self, row) -> dict:
         return {
             'id': row['id'],
@@ -828,104 +801,40 @@ class StorageEngine:
             'last_updated': row['last_updated'],
             'access_count': row['access_count'],
         }
-    
-    def _find_free_episode_slot(self, conn) -> int:
-        """Find a reusable vector slot from consolidated/deleted episodes.
-        
-        If no free slot exists, evict the oldest episode to make room.
-        """
-        # Find lowest-importance consolidated episode and reuse its slot
-        row = conn.execute("""
-            SELECT vec_index FROM episodes 
-            WHERE consolidated = 1 
-            ORDER BY importance ASC LIMIT 1
-        """).fetchone()
-        if row:
-            return row['vec_index']
-        # All slots full — evict the oldest episode, protecting source='api'
-        row = conn.execute("""
-            SELECT id, vec_index, created_at FROM episodes
-            WHERE (source IS NULL OR source != 'api')
-            ORDER BY created_at ASC LIMIT 1
-        """).fetchone()
-        if row is None:
-            # Pathological case: all episodes are source='api' — fall back to
-            # evicting the oldest regardless of source.
-            row = conn.execute("""
-                SELECT id, vec_index, created_at FROM episodes
-                ORDER BY created_at ASC LIMIT 1
-            """).fetchone()
-        if row:
-            oldest_id = row['id']
-            oldest_slot = row['vec_index']
-            logger.warning(
-                f"Memory capacity reached, evicting oldest episode "
-                f"(id={oldest_id}) to make room."
-            )
-            conn.execute("DELETE FROM episodes WHERE id = ?", (oldest_id,))
-            conn.commit()
-            return oldest_slot
-        # Should never reach here (empty DB but overflow?), fallback to 0
-        return 0
-    
-    def _expand_episodic_vectors(self):
-        """Double the episodic vector capacity."""
-        old_size = self._episodic_vectors.shape[0]
-        new_size = old_size * 2
-        new_vectors = np.zeros((new_size, self.embedding_dim), dtype=np.float32)
-        new_vectors[:old_size] = self._episodic_vectors[:]
-        self._atomic_save_vectors(self.episodic_vec_path, new_vectors)
-        self._episodic_vectors = np.load(
-            str(self.episodic_vec_path), mmap_mode='r+'
-        )
-        logger.info(f"Expanded episodic vectors: {old_size} -> {new_size}")
-    
-    def _expand_semantic_vectors(self):
-        """Double the semantic vector capacity."""
-        old_size = self._semantic_vectors.shape[0]
-        new_size = old_size * 2
-        new_vectors = np.zeros((new_size, self.embedding_dim), dtype=np.float32)
-        new_vectors[:old_size] = self._semantic_vectors[:]
-        self._atomic_save_vectors(self.semantic_vec_path, new_vectors)
-        self._semantic_vectors = np.load(
-            str(self.semantic_vec_path), mmap_mode='r+'
-        )
-        logger.info(f"Expanded semantic vectors: {old_size} -> {new_size}")
-    
+
+    def _row_to_link(self, row) -> dict:
+        return {
+            'id': row['id'],
+            'from_episode_id': row['from_episode_id'],
+            'to_episode_id': row['to_episode_id'],
+            'relation_type': row['relation_type'],
+            'created_at': row['created_at'],
+            'confidence': row['confidence'],
+        }
+
     def flush(self):
-        """Flush all pending writes to disk."""
-        if self._conn:
-            self._conn.commit()
-        if self._episodic_vectors is not None:
-            self._episodic_vectors.flush()
-        if self._semantic_vectors is not None:
-            self._semantic_vectors.flush()
-    
+        """Flush pending writes to disk."""
+        self._conn.commit()
+
     def close(self):
         """Close all resources."""
         self.flush()
         if self._conn:
             self._conn.close()
             self._conn = None
-    
+
     def get_storage_stats(self) -> dict:
-        """Return storage statistics."""
         db_size = os.path.getsize(self.db_path) if self.db_path.exists() else 0
-        ep_vec_size = os.path.getsize(self.episodic_vec_path) if self.episodic_vec_path.exists() else 0
-        sem_vec_size = os.path.getsize(self.semantic_vec_path) if self.semantic_vec_path.exists() else 0
-        
         return {
             'db_size_kb': db_size / 1024,
-            'episodic_vectors_kb': ep_vec_size / 1024,
-            'semantic_vectors_kb': sem_vec_size / 1024,
-            'total_size_kb': (db_size + ep_vec_size + sem_vec_size) / 1024,
-            'total_size_mb': (db_size + ep_vec_size + sem_vec_size) / 1024 / 1024,
+            'total_size_kb': db_size / 1024,
+            'total_size_mb': db_size / 1024 / 1024,
             'episode_count': self.count_episodes(),
             'semantic_count': self.count_semantics(),
         }
-    
+
     def __enter__(self):
         return self
-    
+
     def __exit__(self, *args):
         self.close()

@@ -5,7 +5,7 @@ backend-path = ["."]
 
 [project]
 name = "arn-v9"
-version = "0.9.0"
+version = "0.10.0"
 description = "Adaptive Recall Network — local-first persistent memory for AI agents"
 readme = "README.md"
 license = {file = "LICENSE.md"}
@@ -32,6 +32,7 @@ dependencies = [
     "sentence-transformers>=2.7",
     "psutil>=5.9",
     "httpx>=0.27",
+    "sqlite-vec>=0.1.1",
 ]
 
 [project.optional-dependencies]

@@ -10,11 +10,11 @@ Hybrid retrieval memory system:
 - Post-session reflection with user-in-the-loop reconciliation
 """
 
+import math
 import numpy as np
 import time
 import json
 import os
-import tempfile
 import logging
 import threading
 from pathlib import Path
@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from collections import deque
 
 from .embeddings import EmbeddingEngine, EMBEDDING_DIM
+from .retrieval import fuse_rrf, recency_score, mmr_rerank, score_gap_cutoff
 from ..storage.persistence import StorageEngine
 
 logger = logging.getLogger("arn.core")
@@ -594,21 +595,18 @@ class ARNv9:
             memory_type=memory_type,
         )
 
-        # Auto-link to top-3 similar existing memories
+        # Auto-link to top similar existing memories via KNN
         try:
-            all_episodes = self.storage.get_all_episodes(consolidated=None)
-            existing = [ep for ep in all_episodes if ep['id'] != episode_id]
-            if existing:
-                ep_ids_list = [ep['id'] for ep in existing]
-                ep_vectors, ep_ids = self.storage.get_episode_vectors(ep_ids_list)
-                if len(ep_vectors) > 0:
-                    similarities = ep_vectors @ feature_vector
-                    scored = sorted(zip(ep_ids, similarities), key=lambda x: x[1], reverse=True)
-                    for other_id, sim in scored[:3]:
-                        if float(sim) >= AUTO_LINK_SIMILARITY_THRESHOLD:
-                            self.storage.create_link(
-                                episode_id, other_id, "relates_to", confidence=float(sim)
-                            )
+            similar = self.storage.knn_search(feature_vector, top_k=6)
+            links_added = 0
+            for other_id, score in similar:
+                if links_added >= 3:
+                    break
+                if other_id != episode_id and score >= 0.50:
+                    self.storage.create_link(
+                        episode_id, other_id, "relates_to", confidence=score
+                    )
+                    links_added += 1
         except Exception:
             pass
 
@@ -634,154 +632,109 @@ class ARNv9:
                memory_type: Optional[str] = None) -> List[dict]:
         """
         Retrieve relevant memories for a query.
-        
-        Searches ALL episodic memory (both consolidated and unconsolidated)
-        and semantic memory, merges results, and returns top-k by relevance.
-        
-        Consolidated episodes are still searchable — consolidation marks them
-        as processed for semantic extraction but does NOT remove them from
-        recall. They just get a lower recency boost.
+
+        Uses hybrid retrieval: sqlite-vec KNN + FTS5 keyword search, fused
+        via Reciprocal Rank Fusion, then scored with recency + importance,
+        reranked with MMR for diversity, and trimmed at the largest score gap.
         """
         query_vector = self.embedder.encode(query, mode='query')
-        results = []
-        
-        # Search episodic memory (consolidated + unconsolidated), with optional type filter
+        results: List[dict] = []
+
         if include_episodic:
-            all_episodes = self.storage.get_all_episodes(
-                consolidated=None, memory_type=memory_type
-            )
-            if all_episodes:
-                # Filter out superseded episodes (they have a superseded_by pointer)
-                active_episodes = [
-                    ep for ep in all_episodes
-                    if ep.get('superseded_by') is None and ep.get('invalidated_at') is None
-                ]
-                # If filtering removed everything, fall back to all (don't hide data)
-                if not active_episodes:
-                    active_episodes = all_episodes
+            # 1. Vector KNN + FTS5 search
+            vec_results = self.storage.knn_search(query_vector, top_k=top_k * 4)
+            fts_results = self.storage.fts_search(query, top_k=top_k * 4)
 
-                ep_ids_list = [ep['id'] for ep in active_episodes]
-                ep_vectors, ep_ids = self.storage.get_episode_vectors(ep_ids_list)
+            # 2. RRF fusion
+            rrf_scores = fuse_rrf(vec_results, fts_results)
 
-                # Drop any stored vectors whose dimension doesn't match the current query.
-                # This can happen when the embedding model changes between server restarts.
-                if len(ep_vectors) > 0 and ep_vectors.shape[1] != query_vector.shape[0]:
-                    expected_dim = query_vector.shape[0]
-                    mask = [i for i, v in enumerate(ep_vectors) if v.shape[0] == expected_dim]
-                    ep_vectors = ep_vectors[mask] if mask else ep_vectors[:0]
-                    ep_ids = [ep_ids[i] for i in mask]
+            if rrf_scores:
+                # 3. Fetch metadata for all candidates
+                candidate_ids = list(rrf_scores.keys())
+                episodes_map = {
+                    ep['id']: ep
+                    for ep in self.storage.get_episodes_by_ids(candidate_ids)
+                }
 
-                if len(ep_vectors) > 0:
-                    similarities = ep_vectors @ query_vector
-                    id_to_ep = {ep['id']: ep for ep in active_episodes}
-                    
-                    # First pass: compute raw similarity scores
-                    sim_scored = []
-                    for eid, sim in zip(ep_ids, similarities):
-                        ep = id_to_ep.get(eid)
-                        if ep:
-                            sim_scored.append((eid, ep, float(sim)))
-                    
-                    # Pre-compute content similarity matrix for supersession detection
-                    # Only compute for top candidates to avoid O(n²) on large corpora
-                    n_check = min(len(sim_scored), top_k * 4)
-                    top_sim_scored = sorted(sim_scored, key=lambda x: x[2], reverse=True)[:n_check]
-                    
-                    # Build a set of superseded episode IDs efficiently
-                    superseded_ids = set()
-                    top_ep_ids = [eid for eid, _, _ in top_sim_scored]
-                    top_ep_vecs = np.array([ep_vectors[ep_ids.index(eid)] for eid in top_ep_ids])
-                    if len(top_ep_vecs) > 1:
-                        # Pairwise similarities among top candidates
-                        pair_sims = top_ep_vecs @ top_ep_vecs.T
-                        sim_threshold = 0.75
-                        for i in range(len(top_ep_ids)):
-                            for j in range(i + 1, len(top_ep_ids)):
-                                if pair_sims[i, j] > sim_threshold:
-                                    ep_i = id_to_ep[top_ep_ids[i]]
-                                    ep_j = id_to_ep[top_ep_ids[j]]
-                                    # The older one is superseded
-                                    if ep_i['created_at'] < ep_j['created_at']:
-                                        superseded_ids.add(top_ep_ids[i])
-                                    else:
-                                        superseded_ids.add(top_ep_ids[j])
-                    
-                    for eid, ep, sim in top_sim_scored:
-                        # Recency: exponential decay with 7-day half-life for creation
-                        age_seconds = max(1.0, time.time() - ep['created_at'])
-                        creation_recency = 0.5 ** (age_seconds / (86400.0 * 7))
-                        
-                        # Access recency: 1-day half-life
-                        last_access = ep.get('last_accessed') or ep['created_at']
-                        access_age = max(1.0, time.time() - last_access)
-                        access_recency = 0.5 ** (access_age / 86400.0)
-                        
-                        # Access frequency bonus (logarithmic, capped)
-                        freq_bonus = min(1.0, np.log1p(ep['access_count']) / 3.0)
-                        
-                        # Composite recency: creation + access blended
-                        recency_blend = 0.4 * creation_recency + 0.6 * access_recency + 0.1 * freq_bonus
-                        recency_blend = min(1.0, recency_blend)
-                        
-                        # Supersession penalty
-                        supersession_penalty = 0.25 if eid in superseded_ids else 0.0
-                        
-                        # Surprise bonus: high-error episodes are more informative
-                        surprise_bonus = 0.05 * ep['prediction_error']
-                        
-                        # Hybrid score: similarity + recency + importance + surprise
-                        # Weights adjusted to sum to 1.0 at maximum:
-                        #   sim=0.58, recency=0.13, importance=0.19,
-                        #   non-superseded bonus=0.05, surprise=0.05
-                        score = (
-                            0.58 * sim +
-                            0.13 * recency_blend +
-                            0.19 * ep['importance'] +
-                            surprise_bonus -
-                            supersession_penalty
-                        )
-                        
-                        # Boost current (non-superseded) episodes
-                        if ep.get('superseded_by') is None and ep.get('invalidated_at') is None:
-                            score += 0.05
-                        
-                        results.append({
+                # 4. Filter + composite score
+                scored: List[Tuple[int, float, dict]] = []
+                for eid, rrf in rrf_scores.items():
+                    ep = episodes_map.get(eid)
+                    if ep is None:
+                        continue
+                    if ep.get('invalidated_at') is not None:
+                        continue
+                    if ep.get('superseded_by') is not None:
+                        continue
+                    if memory_type and ep.get('memory_type') != memory_type:
+                        continue
+                    rec = recency_score(ep['created_at'])
+                    freq_boost = math.log1p(ep.get('access_count', 0)) * 0.05
+                    score = rrf + rec * 0.3 + ep['importance'] * 0.15 + freq_boost
+                    scored.append((eid, score, ep))
+
+                # 5. Sort and take top_k * 2 candidates for MMR
+                scored.sort(key=lambda x: x[1], reverse=True)
+                top_scored = scored[:top_k * 2]
+
+                if top_scored:
+                    # 6. MMR reranking (needs vectors for the candidates)
+                    top_ids = [eid for eid, _, _ in top_scored]
+                    ep_vectors, ep_ids = self.storage.get_episode_vectors(top_ids)
+                    id_to_vec_idx = {eid: i for i, eid in enumerate(ep_ids)}
+
+                    ordered_vecs: List[np.ndarray] = []
+                    ordered_items: List[dict] = []
+                    for eid, score, ep in top_scored:
+                        if eid not in id_to_vec_idx:
+                            continue
+                        vec = ep_vectors[id_to_vec_idx[eid]]
+                        if vec.shape[0] != query_vector.shape[0]:
+                            continue
+                        ordered_vecs.append(vec)
+                        ordered_items.append({
                             'type': 'episodic',
                             'id': eid,
                             'content': ep['content'],
                             'score': score,
-                            'similarity': float(sim),
+                            'similarity': float(np.dot(vec, query_vector)),
                             'importance': ep['importance'],
                             'created_at': ep['created_at'],
-                            'access_count': ep['access_count'],
+                            'access_count': ep.get('access_count', 0),
                             'context': ep.get('context', {}),
                             'memory_type': ep.get('memory_type', 'episode'),
                             'source': ep.get('source', 'unknown'),
                         })
-                        
-                        # Update access count
-                        self.storage.update_episode_access(eid)
-        
-        # Search semantic memory
+
+                    if ordered_items:
+                        result_vecs = np.array(ordered_vecs, dtype=np.float32)
+                        reranked = mmr_rerank(
+                            query_vector, ordered_items, result_vecs,
+                            top_k=min(top_k * 2, len(ordered_items))
+                        )
+                        # 7. Score gap cutoff
+                        episodic_results = score_gap_cutoff(reranked, top_k=top_k)
+                        results.extend(episodic_results)
+
+                # 8. Update access counts
+                for r in results:
+                    if r['type'] == 'episodic':
+                        self.storage.update_episode_access(r['id'])
+
+        # Semantic memory (full vector scan — typically small corpus)
         if include_semantic:
             sem_vectors, sem_ids = self.storage.get_semantic_vectors()
-            if len(sem_vectors) > 0:
+            if len(sem_vectors) > 0 and sem_vectors.shape[1] == query_vector.shape[0]:
                 similarities = sem_vectors @ query_vector
-                
                 semantics = self.storage.get_all_semantics()
                 id_to_sem = {s['id']: s for s in semantics}
-                
                 for sid, sim in zip(sem_ids, similarities):
                     sem = id_to_sem.get(sid)
                     if sem:
-                        # Confidence-weighted score  
                         score = float(sim) * (0.5 + 0.5 * sem['confidence'])
-                        
-                        # Use representative_content if available, else label
                         content = sem.get('schema', {}).get(
                             'representative_content', sem['concept_label']
                         )
-                        
                         results.append({
                             'type': 'semantic',
                             'id': sid,
@@ -792,27 +745,24 @@ class ARNv9:
                             'evidence_count': sem['evidence_count'],
                             'contradictions': sem.get('contradiction_log', []),
                         })
-        
-        # Sort by score and return top-k
+
         results.sort(key=lambda r: r['score'], reverse=True)
         top_results = results[:top_k]
 
-        # Pull graph neighbors into the recall window. If a highly-ranked
-        # episodic hit is linked to another candidate, that neighbor is useful
-        # context even when its raw embedding score is just below top-k.
+        # Pull graph neighbors into the recall window
         if top_results:
-            result_by_id = {
-                r['id']: r for r in results
-                if r['type'] == 'episodic'
-            }
+            result_by_id = {r['id']: r for r in results if r['type'] == 'episodic'}
             top_ids = {r['id'] for r in top_results if r['type'] == 'episodic'}
             linked_results = []
             for r in list(top_results):
                 if r['type'] != 'episodic':
                     continue
-                links = self.storage.get_links_for_episode(r['id'])
-                for link in links:
-                    other_id = link['from_episode_id'] if link['to_episode_id'] == r['id'] else link['to_episode_id']
+                for link in self.storage.get_links_for_episode(r['id']):
+                    other_id = (
+                        link['from_episode_id']
+                        if link['to_episode_id'] == r['id']
+                        else link['to_episode_id']
+                    )
                     if other_id in top_ids or other_id == r['id']:
                         continue
                     other = result_by_id.get(other_id)
@@ -824,7 +774,7 @@ class ARNv9:
             top_results.extend(linked_results)
             top_results.sort(key=lambda r: r['score'], reverse=True)
             top_results = top_results[:top_k]
-        
+
         # Prepend active working memory items not already in results
         wm_active = self.working_memory.get_active()
         existing_ids = {r['id'] for r in top_results if r['type'] == 'episodic'}
