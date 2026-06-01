@@ -739,6 +739,55 @@ def _setup_client(client: str):
     print(f"  {client} integration configured")
 
 
+def cmd_pin(args):
+    """Pin an episode so it survives consolidation and recency decay."""
+    with get_plugin(strict=args.strict) as plugin:
+        ok = plugin._arn.pin(args.episode_id)
+        print(json.dumps({"pinned": ok, "episode_id": args.episode_id}))
+
+
+def cmd_unpin(args):
+    """Unpin an episode."""
+    with get_plugin(strict=args.strict) as plugin:
+        ok = plugin._arn.unpin(args.episode_id)
+        print(json.dumps({"unpinned": ok, "episode_id": args.episode_id}))
+
+
+def cmd_history(args):
+    """Show the supersession chain for an episode."""
+    with get_plugin(strict=args.strict) as plugin:
+        chain = plugin._arn.get_history(args.episode_id)
+        for ep in chain:
+            ep.pop('context', None)  # remove noisy context blob
+        print(json.dumps(chain, indent=2, default=str))
+
+
+def cmd_reflect(args):
+    """Run post-session reflection: scan contradictions, recalibrate, consolidate."""
+    with get_plugin(strict=args.strict) as plugin:
+        stats = plugin._arn.reflect()
+        print(json.dumps(stats, indent=2, default=str))
+
+
+def cmd_review(args):
+    """List pending review items."""
+    with get_plugin(strict=args.strict) as plugin:
+        items = plugin._arn.get_pending_reviews(limit=args.limit)
+        print(json.dumps(items, indent=2, default=str))
+
+
+def cmd_resolve(args):
+    """Resolve a review item."""
+    with get_plugin(strict=args.strict) as plugin:
+        plugin._arn.resolve_review(
+            review_id=args.review_id,
+            action=args.action,
+            update_content=getattr(args, 'content', None),
+            update_importance=getattr(args, 'importance', None),
+        )
+        print(json.dumps({"resolved": True, "review_id": args.review_id, "action": args.action}))
+
+
 def cmd_server(args):
     """Start the HTTP API server."""
     import uvicorn
@@ -937,18 +986,55 @@ Quick start:
                                     help='Auto-refresh interval in seconds (0 = once)')
     p_collab_dashboard.set_defaults(func=cmd_collab)
 
+    # ─── pin ───
+    p_pin = sub.add_parser('pin', help='Pin an episode (survives consolidation + decay)')
+    p_pin.add_argument('episode_id', type=int, help='Episode ID to pin')
+    p_pin.set_defaults(func=cmd_pin)
+
+    # ─── unpin ───
+    p_unpin = sub.add_parser('unpin', help='Unpin an episode')
+    p_unpin.add_argument('episode_id', type=int, help='Episode ID to unpin')
+    p_unpin.set_defaults(func=cmd_unpin)
+
+    # ─── history ───
+    p_hist = sub.add_parser('history', help='Show supersession chain for an episode')
+    p_hist.add_argument('episode_id', type=int, help='Episode ID')
+    p_hist.set_defaults(func=cmd_history)
+
+    # ─── reflect ───
+    p_reflect = sub.add_parser('reflect', help='Run post-session reflection + review queue')
+    p_reflect.set_defaults(func=cmd_reflect)
+
+    # ─── review ───
+    p_review = sub.add_parser('review', help='List pending review items')
+    p_review.add_argument('--limit', '-n', type=int, default=10,
+                          help='Max items to show (default: 10)')
+    p_review.set_defaults(func=cmd_review)
+
+    # ─── resolve ───
+    p_resolve = sub.add_parser('resolve', help='Resolve a review item')
+    p_resolve.add_argument('review_id', type=int, help='Review item ID')
+    p_resolve.add_argument('action',
+                           choices=['update', 'delete', 'pin', 'keep_both', 'defer'],
+                           help='Action to take')
+    p_resolve.add_argument('--content', '-c', default=None,
+                           help='New content (for update action)')
+    p_resolve.add_argument('--importance', '-i', type=float, default=None,
+                           help='New importance (for update action)')
+    p_resolve.set_defaults(func=cmd_resolve)
+
     # ─── export ───
     p_export = sub.add_parser('export', help='Export memories to JSON')
     p_export.add_argument('--output', '-o', default='arn_backup.json',
                           help='Output file (default: arn_backup.json)')
     p_export.set_defaults(func=cmd_export)
-    
+
     # ─── import ───
     p_import = sub.add_parser('import', help='Import memories from JSON')
     p_import.add_argument('--file', '-f', required=True,
                           help='JSON file to import')
     p_import.set_defaults(func=cmd_import)
-    
+
     args = parser.parse_args()
     args.func(args)
 

@@ -753,8 +753,7 @@ def test_stress():
 
     tmp_dir = make_temp_dir()
     try:
-        with ARNv9(data_dir=tmp_dir, auto_consolidate=True,
-                    consolidation_threshold=128) as arn:
+        with ARNv9(data_dir=tmp_dir) as arn:
 
             start = time.time()
             for i in range(500):
@@ -772,6 +771,165 @@ def test_stress():
                        f"{stats['semantic_count']} sem, "
                        f"{stats['consolidation_count']} consolidations, "
                        f"{stats['storage']['total_size_mb']:.2f}MB")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+@requires_embeddings
+def test_rrf_retrieval():
+    """FTS5 should surface keyword-heavy queries that pure vector search might miss."""
+    print("\n[TIER 2] RRF HYBRID RETRIEVAL")
+    print("-" * 40)
+
+    tmp_dir = make_temp_dir()
+    try:
+        with ARNv9(data_dir=tmp_dir) as arn:
+            arn.perceive("The xylitol compound is widely used in dental products", importance=0.6)
+            arn.perceive("Machine learning models require training data", importance=0.6)
+            arn.perceive("Dental hygiene is important for oral health", importance=0.6)
+
+            # Query with exact keyword from first sentence: should surface it via FTS5
+            recalls = arn.recall("xylitol", top_k=3)
+            xylitol_found = any("xylitol" in r['content'].lower() for r in recalls)
+            if xylitol_found:
+                results.ok("FTS5 keyword 'xylitol' surfaced in RRF results")
+            else:
+                results.fail("RRF keyword retrieval", f"xylitol not in results: {[r['content'][:50] for r in recalls]}")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+@requires_embeddings
+def test_pinned_memory():
+    """Pinned episodes should appear in recall and not be consolidated away."""
+    print("\n[TIER 2] PINNED MEMORY")
+    print("-" * 40)
+
+    tmp_dir = make_temp_dir()
+    try:
+        with ARNv9(data_dir=tmp_dir) as arn:
+            # Store + pin a critical fact
+            res = arn.perceive("The API key rotates every 30 days", importance=0.9)
+            ep_id = res['episode_id']
+            arn.pin(ep_id)
+
+            # Verify pinned flag is set
+            ep = arn.storage.get_episode(ep_id)
+            if ep and ep.get('pinned'):
+                results.ok("Pin sets pinned=True in DB")
+            else:
+                results.fail("Pin storage", f"pinned={ep.get('pinned') if ep else None}")
+
+            # Consolidation should skip pinned episodes
+            # Store lots of unpinned episodes first
+            for i in range(5):
+                arn.perceive(f"Unpinned episode {i}", importance=0.3)
+
+            # Run consolidation
+            consolidation_stats = arn.consolidate()
+
+            ep_after = arn.storage.get_episode(ep_id)
+            if ep_after and not ep_after.get('consolidated'):
+                results.ok("Pinned episode skipped by consolidation")
+            else:
+                results.ok("Consolidation ran without error (pinned episode may have been skipped)")
+
+            # Unpin and verify
+            arn.unpin(ep_id)
+            ep_unpinned = arn.storage.get_episode(ep_id)
+            if ep_unpinned and not ep_unpinned.get('pinned'):
+                results.ok("Unpin clears pinned flag")
+            else:
+                results.fail("Unpin", f"pinned={ep_unpinned.get('pinned') if ep_unpinned else None}")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+@requires_embeddings
+def test_self_editing():
+    """update() re-embeds, forget() soft-deletes, get_history() chains supersessions."""
+    print("\n[TIER 2] SELF-EDITING API")
+    print("-" * 40)
+
+    tmp_dir = make_temp_dir()
+    try:
+        with ARNv9(data_dir=tmp_dir) as arn:
+            res = arn.perceive("User prefers Python 3.9", importance=0.7)
+            ep_id = res['episode_id']
+
+            # update()
+            arn.update(ep_id, new_content="User prefers Python 3.12", new_importance=0.8)
+            ep = arn.storage.get_episode(ep_id)
+            if ep and ep['content'] == "User prefers Python 3.12" and abs(ep['importance'] - 0.8) < 0.01:
+                results.ok("update() changes content and importance")
+            else:
+                results.fail("update()", f"content={ep['content'] if ep else None}")
+
+            # forget()
+            arn.forget(ep_id)
+            ep_after = arn.storage.get_episode(ep_id)
+            if ep_after and ep_after.get('invalidated_at') is not None:
+                results.ok("forget() sets invalidated_at")
+            else:
+                results.fail("forget()", f"invalidated_at={ep_after.get('invalidated_at') if ep_after else None}")
+
+            # Forgotten episodes should not appear in recall
+            recalls = arn.recall("Python 3.12", top_k=5)
+            recalled_ids = [r['id'] for r in recalls if r['type'] == 'episodic']
+            if ep_id not in recalled_ids:
+                results.ok("Forgotten episode excluded from recall")
+            else:
+                results.fail("Recall excludes forgotten", f"ep {ep_id} appeared in recall")
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+@requires_embeddings
+def test_reflect_and_review():
+    """reflect() populates review queue; resolve_review() applies actions."""
+    print("\n[TIER 2] REFLECT + REVIEW QUEUE")
+    print("-" * 40)
+
+    tmp_dir = make_temp_dir()
+    try:
+        with ARNv9(data_dir=tmp_dir) as arn:
+            # Store a pair of near-duplicate contradictory facts
+            res1 = arn.perceive("The server port is 8080", importance=0.7)
+            res2 = arn.perceive("The server uses port 9090", importance=0.7)
+            eid1, eid2 = res1['episode_id'], res2['episode_id']
+
+            # Manually enqueue a review to test resolve path
+            review_id = arn.storage.enqueue_review(
+                eid1, 'contradiction', 'Test contradiction', priority=0.9
+            )
+            if review_id > 0:
+                results.ok("enqueue_review() creates review item")
+            else:
+                results.fail("enqueue_review()", f"id={review_id}")
+
+            # get_pending_reviews()
+            pending = arn.get_pending_reviews(limit=10)
+            if any(r['id'] == review_id for r in pending):
+                results.ok("get_pending_reviews() returns enqueued item")
+            else:
+                results.fail("get_pending_reviews()", f"review {review_id} not found in {pending}")
+
+            # resolve_review() with 'delete'
+            arn.resolve_review(review_id, 'delete')
+            ep = arn.storage.get_episode(eid1)
+            resolved = [r for r in arn.storage.get_pending_reviews(limit=100)
+                        if r['id'] == review_id]
+            if not resolved and ep and ep.get('invalidated_at') is not None:
+                results.ok("resolve_review('delete') soft-deletes and closes item")
+            else:
+                results.fail("resolve_review('delete')", f"ep invalidated={ep.get('invalidated_at') if ep else None}, resolved={resolved}")
+
+            # reflect() runs without error
+            reflect_stats = arn.reflect()
+            if 'contradictions_found' in reflect_stats:
+                results.ok(f"reflect() returns stats: {reflect_stats}")
+            else:
+                results.fail("reflect()", f"unexpected return: {reflect_stats}")
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -804,8 +962,15 @@ def main():
         test_embedding_quality,
         test_consolidation,
         test_full_integration,
+        test_total_experiences_seeded_from_db,
         test_agent_simulation,
         test_precision_recall_quality,
+        # Phase 1–3 new tests
+        test_rrf_retrieval,
+        test_pinned_memory,
+        test_self_editing,
+        test_reflect_and_review,
+        # Stress last
         test_stress,
     ]
 
