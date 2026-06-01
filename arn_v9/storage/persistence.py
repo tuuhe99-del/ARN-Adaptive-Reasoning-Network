@@ -29,7 +29,7 @@ from ..core.embeddings import EMBEDDING_DIM
 
 logger = logging.getLogger("arn.storage")
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 class _ThreadLocalConnection:
@@ -141,7 +141,11 @@ class StorageEngine:
                 superseded_by INTEGER,
                 invalidated_at REAL,
                 user_id TEXT,
-                memory_type TEXT DEFAULT 'episode'
+                memory_type TEXT DEFAULT 'episode',
+                valid_from REAL,
+                valid_until REAL,
+                supersedes INTEGER,
+                pinned INTEGER DEFAULT 0
             )
         """)
         conn.execute("""
@@ -177,6 +181,29 @@ class StorageEngine:
                 UNIQUE (from_episode_id, to_episode_id, relation_type)
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS entities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                episode_id INTEGER NOT NULL,
+                entity_text TEXT NOT NULL,
+                entity_type TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                FOREIGN KEY (episode_id) REFERENCES episodes(id) ON DELETE CASCADE
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS memory_review_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                episode_id INTEGER NOT NULL,
+                review_type TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                priority REAL DEFAULT 0.5,
+                created_at REAL NOT NULL,
+                resolved_at REAL,
+                resolution TEXT,
+                FOREIGN KEY (episode_id) REFERENCES episodes(id) ON DELETE CASCADE
+            )
+        """)
 
         for idx_sql in [
             "CREATE INDEX IF NOT EXISTS idx_episodes_importance ON episodes(importance DESC)",
@@ -186,9 +213,13 @@ class StorageEngine:
             "CREATE INDEX IF NOT EXISTS idx_episodes_expires ON episodes(expires_at)",
             "CREATE INDEX IF NOT EXISTS idx_episodes_user ON episodes(user_id)",
             "CREATE INDEX IF NOT EXISTS idx_episodes_memory_type ON episodes(memory_type)",
+            "CREATE INDEX IF NOT EXISTS idx_episodes_pinned ON episodes(pinned)",
             "CREATE INDEX IF NOT EXISTS idx_semantic_confidence ON semantic_nodes(confidence DESC)",
             "CREATE INDEX IF NOT EXISTS idx_links_from ON memory_links(from_episode_id)",
             "CREATE INDEX IF NOT EXISTS idx_links_to ON memory_links(to_episode_id)",
+            "CREATE INDEX IF NOT EXISTS idx_entities_text ON entities(entity_text)",
+            "CREATE INDEX IF NOT EXISTS idx_entities_episode ON entities(episode_id)",
+            "CREATE INDEX IF NOT EXISTS idx_review_priority ON memory_review_queue(priority DESC)",
         ]:
             conn.execute(idx_sql)
 
@@ -303,6 +334,9 @@ class StorageEngine:
         if from_version < 5:
             self._migrate_v4_to_v5(conn)
 
+        if from_version < 6:
+            self._migrate_v5_to_v6(conn)
+
         conn.commit()
 
     def _migrate_v4_to_v5(self, conn: sqlite3.Connection):
@@ -393,6 +427,51 @@ class StorageEngine:
         conn.commit()
         logger.info("Migrated schema v4 → v5 (sqlite-vec + FTS5)")
 
+    def _migrate_v5_to_v6(self, conn: sqlite3.Connection):
+        """v5 → v6: bi-temporal columns, supersedes, pinned, entities, review queue."""
+        for sql in [
+            "ALTER TABLE episodes ADD COLUMN valid_from REAL",
+            "ALTER TABLE episodes ADD COLUMN valid_until REAL",
+            "ALTER TABLE episodes ADD COLUMN supersedes INTEGER",
+            "ALTER TABLE episodes ADD COLUMN pinned INTEGER DEFAULT 0",
+        ]:
+            try:
+                conn.execute(sql)
+            except Exception:
+                pass  # column already exists
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS entities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                episode_id INTEGER NOT NULL,
+                entity_text TEXT NOT NULL,
+                entity_type TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                FOREIGN KEY (episode_id) REFERENCES episodes(id) ON DELETE CASCADE
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_entities_text ON entities(entity_text)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_entities_episode ON entities(episode_id)")
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS memory_review_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                episode_id INTEGER NOT NULL,
+                review_type TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                priority REAL DEFAULT 0.5,
+                created_at REAL NOT NULL,
+                resolved_at REAL,
+                resolution TEXT,
+                FOREIGN KEY (episode_id) REFERENCES episodes(id) ON DELETE CASCADE
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_review_priority ON memory_review_queue(priority DESC)"
+        )
+        conn.commit()
+        logger.info("Migrated schema v5 → v6 (bi-temporal, entities, review queue)")
+
     # =========================================================
     # EPISODIC MEMORY OPERATIONS
     # =========================================================
@@ -403,24 +482,26 @@ class StorageEngine:
                       source: str = 'user',
                       expires_at: float = None,
                       user_id: str = None,
-                      memory_type: str = 'episode') -> int:
+                      memory_type: str = 'episode',
+                      valid_from: float = None) -> int:
         """Store a new episodic memory. Returns episode ID."""
         with self._lock:
             conn = self._get_conn()
             now = time.time()
             normalized = ' '.join(content.lower().split())
             c_hash = hashlib.sha256(normalized.encode()).hexdigest()[:16]
+            vf = valid_from if valid_from is not None else now
 
             cursor = conn.execute("""
                 INSERT INTO episodes
                     (vec_index, content, content_hash, context_json,
                      importance, prediction_error, created_at, source,
-                     expires_at, user_id, memory_type)
-                VALUES (-1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     expires_at, user_id, memory_type, valid_from)
+                VALUES (-1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 content, c_hash, json.dumps(context or {}),
                 importance, prediction_error, now, source,
-                expires_at, user_id, memory_type,
+                expires_at, user_id, memory_type, vf,
             ))
             ep_id = cursor.lastrowid
 
@@ -594,6 +675,176 @@ class StorageEngine:
         return conn.execute(
             "SELECT COUNT(*) FROM episodes WHERE consolidated=?", (int(consolidated),)
         ).fetchone()[0]
+
+    def supersede_episode(self, old_id: int, new_id: int):
+        """Mark old_id as superseded by new_id (bi-temporal invalidation)."""
+        conn = self._get_conn()
+        now = time.time()
+        conn.execute(
+            "UPDATE episodes SET superseded_by=?, valid_until=?, invalidated_at=? WHERE id=?",
+            (new_id, now, now, old_id)
+        )
+        conn.execute("UPDATE episodes SET supersedes=? WHERE id=?", (old_id, new_id))
+        conn.commit()
+
+    def set_pinned(self, episode_id: int, pinned: bool) -> bool:
+        conn = self._get_conn()
+        r = conn.execute(
+            "UPDATE episodes SET pinned=? WHERE id=?", (int(pinned), episode_id)
+        )
+        conn.commit()
+        return r.rowcount > 0
+
+    def update_episode(self, episode_id: int, updates: dict,
+                       new_vector: np.ndarray = None):
+        """Update episode fields. Re-embeds if new_vector is provided."""
+        conn = self._get_conn()
+        if not updates and new_vector is None:
+            return
+        parts = []
+        params = []
+        for k, v in updates.items():
+            parts.append(f"{k} = ?")
+            params.append(v)
+        if parts:
+            params.append(episode_id)
+            conn.execute(
+                f"UPDATE episodes SET {', '.join(parts)} WHERE id = ?", params
+            )
+        if new_vector is not None:
+            conn.execute(
+                "INSERT OR REPLACE INTO episode_embeddings(rowid, embedding) VALUES (?, ?)",
+                (episode_id, new_vector.astype(np.float32).tobytes())
+            )
+        conn.commit()
+
+    def invalidate_episode(self, episode_id: int):
+        """Soft-delete: set invalidated_at timestamp."""
+        conn = self._get_conn()
+        conn.execute(
+            "UPDATE episodes SET invalidated_at=? WHERE id=?",
+            (time.time(), episode_id)
+        )
+        conn.commit()
+
+    def get_supersession_chain(self, episode_id: int) -> List[dict]:
+        """Return the full supersession chain anchored at episode_id."""
+        conn = self._get_conn()
+        visited = set()
+        chain = []
+
+        # Walk backwards (supersedes)
+        cur_id = episode_id
+        while cur_id and cur_id not in visited:
+            row = conn.execute("SELECT * FROM episodes WHERE id=?", (cur_id,)).fetchone()
+            if row is None:
+                break
+            visited.add(cur_id)
+            chain.insert(0, self._row_to_episode(row))
+            cur_id = row['supersedes'] if 'supersedes' in row.keys() else None
+
+        # Walk forwards (superseded_by)
+        cur_id = episode_id
+        while True:
+            row = conn.execute("SELECT * FROM episodes WHERE id=?", (cur_id,)).fetchone()
+            if row is None:
+                break
+            next_id = row['superseded_by'] if 'superseded_by' in row.keys() else None
+            if not next_id or next_id in visited:
+                break
+            visited.add(next_id)
+            fwd = conn.execute("SELECT * FROM episodes WHERE id=?", (next_id,)).fetchone()
+            if fwd:
+                chain.append(self._row_to_episode(fwd))
+            cur_id = next_id
+
+        return sorted(chain, key=lambda e: e['created_at'])
+
+    # =========================================================
+    # ENTITY OPERATIONS
+    # =========================================================
+
+    def store_entities(self, episode_id: int, entities: List[Tuple[str, str]]):
+        """Store extracted entities for an episode."""
+        if not entities:
+            return
+        conn = self._get_conn()
+        now = time.time()
+        conn.executemany(
+            "INSERT INTO entities (episode_id, entity_text, entity_type, created_at) VALUES (?, ?, ?, ?)",
+            [(episode_id, text, etype, now) for text, etype in entities]
+        )
+        conn.commit()
+
+    def search_entities(self, query: str, top_k: int = 20) -> List[Tuple[int, float]]:
+        """Find episodes matching query tokens via entity table."""
+        tokens = [t.lower() for t in query.split() if len(t) >= 3]
+        if not tokens:
+            return []
+        conn = self._get_conn()
+        placeholders = ','.join('?' * len(tokens))
+        rows = conn.execute(
+            f"SELECT episode_id, COUNT(*) as hits FROM entities "
+            f"WHERE lower(entity_text) IN ({placeholders}) "
+            f"GROUP BY episode_id ORDER BY hits DESC LIMIT ?",
+            tokens + [top_k]
+        ).fetchall()
+        if not rows:
+            return []
+        max_hits = max(r[1] for r in rows)
+        return [(r[0], r[1] / max_hits) for r in rows]
+
+    # =========================================================
+    # REVIEW QUEUE OPERATIONS
+    # =========================================================
+
+    def enqueue_review(self, episode_id: int, review_type: str,
+                       reason: str, priority: float = 0.5) -> int:
+        """Add to review queue; deduplicated by (episode_id, review_type) for open items."""
+        conn = self._get_conn()
+        existing = conn.execute(
+            "SELECT id FROM memory_review_queue "
+            "WHERE episode_id=? AND review_type=? AND resolved_at IS NULL",
+            (episode_id, review_type)
+        ).fetchone()
+        if existing:
+            return existing[0]
+        cursor = conn.execute(
+            "INSERT INTO memory_review_queue "
+            "(episode_id, review_type, reason, priority, created_at) VALUES (?, ?, ?, ?, ?)",
+            (episode_id, review_type, reason, priority, time.time())
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+    def get_pending_reviews(self, limit: int = 10) -> List[dict]:
+        """Return open review items joined with episode content."""
+        conn = self._get_conn()
+        rows = conn.execute("""
+            SELECT r.id, r.episode_id, r.review_type, r.reason, r.priority,
+                   r.created_at, e.content, e.importance
+            FROM memory_review_queue r
+            JOIN episodes e ON e.id = r.episode_id
+            WHERE r.resolved_at IS NULL
+            ORDER BY r.priority DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+        return [
+            {
+                'id': r[0], 'episode_id': r[1], 'review_type': r[2],
+                'reason': r[3], 'priority': r[4], 'created_at': r[5],
+                'content': r[6], 'importance': r[7],
+            }
+            for r in rows
+        ]
+
+    def resolve_review(self, review_id: int, resolution: str):
+        conn = self._get_conn()
+        conn.execute(
+            "UPDATE memory_review_queue SET resolved_at=?, resolution=? WHERE id=?",
+            (time.time(), resolution, review_id)
+        )
+        conn.commit()
 
     # =========================================================
     # SEMANTIC MEMORY OPERATIONS
@@ -786,6 +1037,10 @@ class StorageEngine:
             'invalidated_at': row['invalidated_at'] if 'invalidated_at' in keys else None,
             'user_id': row['user_id'] if 'user_id' in keys else None,
             'memory_type': row['memory_type'] if 'memory_type' in keys else 'episode',
+            'valid_from': row['valid_from'] if 'valid_from' in keys else None,
+            'valid_until': row['valid_until'] if 'valid_until' in keys else None,
+            'supersedes': row['supersedes'] if 'supersedes' in keys else None,
+            'pinned': bool(row['pinned']) if 'pinned' in keys else False,
         }
 
     def _row_to_semantic(self, row) -> dict:

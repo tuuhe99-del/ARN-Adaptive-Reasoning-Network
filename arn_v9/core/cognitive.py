@@ -24,6 +24,7 @@ from collections import deque
 
 from .embeddings import EmbeddingEngine, EMBEDDING_DIM
 from .retrieval import fuse_rrf, recency_score, mmr_rerank, score_gap_cutoff
+from .entities import extract_entities
 from ..storage.persistence import StorageEngine
 
 logger = logging.getLogger("arn.core")
@@ -183,8 +184,11 @@ class ConsolidationEngine:
             'episodes_pruned': 0,
         }
         
-        # Get unconsolidated episodes sorted by replay priority
-        episodes = storage.get_all_episodes(consolidated=False)
+        # Get unconsolidated, unpinned episodes sorted by replay priority
+        episodes = [
+            ep for ep in storage.get_all_episodes(consolidated=False)
+            if not ep.get('pinned', False)
+        ]
         if len(episodes) < self.min_cluster_size:
             return stats
         
@@ -595,6 +599,14 @@ class ARNv9:
             memory_type=memory_type,
         )
 
+        # Extract and store entities
+        try:
+            entities = extract_entities(content)
+            if entities:
+                self.storage.store_entities(episode_id, entities)
+        except Exception:
+            pass
+
         # Auto-link to top similar existing memories via KNN
         try:
             similar = self.storage.knn_search(feature_vector, top_k=6)
@@ -641,12 +653,13 @@ class ARNv9:
         results: List[dict] = []
 
         if include_episodic:
-            # 1. Vector KNN + FTS5 search
+            # 1. Vector KNN + FTS5 + entity search
             vec_results = self.storage.knn_search(query_vector, top_k=top_k * 4)
             fts_results = self.storage.fts_search(query, top_k=top_k * 4)
+            entity_results = self.storage.search_entities(query, top_k=top_k * 4)
 
             # 2. RRF fusion
-            rrf_scores = fuse_rrf(vec_results, fts_results)
+            rrf_scores = fuse_rrf(vec_results, fts_results, entity_results)
 
             if rrf_scores:
                 # 3. Fetch metadata for all candidates
@@ -668,9 +681,11 @@ class ARNv9:
                         continue
                     if memory_type and ep.get('memory_type') != memory_type:
                         continue
-                    rec = recency_score(ep['created_at'])
+                    pinned = ep.get('pinned', False)
+                    rec = 1.0 if pinned else recency_score(ep['created_at'])
                     freq_boost = math.log1p(ep.get('access_count', 0)) * 0.05
-                    score = rrf + rec * 0.3 + ep['importance'] * 0.15 + freq_boost
+                    pin_boost = 0.15 if pinned else 0.0
+                    score = rrf + rec * 0.3 + ep['importance'] * 0.15 + freq_boost + pin_boost
                     scored.append((eid, score, ep))
 
                 # 5. Sort and take top_k * 2 candidates for MMR
@@ -812,7 +827,7 @@ class ARNv9:
     def consolidate(self) -> dict:
         """
         Run memory consolidation (the "sleep" phase).
-        
+
         Transfers episodic memories to semantic memory through
         clustering and pattern extraction.
         """
@@ -824,6 +839,144 @@ class ARNv9:
         self._save_state()
         logger.info(f"Consolidation complete: {stats}")
         return stats
+
+    # =========================================================
+    # PHASE 2: SELF-EDITING API
+    # =========================================================
+
+    def pin(self, episode_id: int) -> bool:
+        """Pin an episode so it survives consolidation and recency decay."""
+        return self.storage.set_pinned(episode_id, True)
+
+    def unpin(self, episode_id: int) -> bool:
+        """Unpin an episode."""
+        return self.storage.set_pinned(episode_id, False)
+
+    def update(self, episode_id: int, new_content: str = None,
+               new_importance: float = None) -> bool:
+        """Update episode content and/or importance. Re-encodes if content changes."""
+        updates = {}
+        new_vector = None
+        if new_content is not None:
+            updates['content'] = new_content
+            normalized = ' '.join(new_content.lower().split())
+            import hashlib
+            updates['content_hash'] = hashlib.sha256(normalized.encode()).hexdigest()[:16]
+            new_vector = self.embedder.encode(new_content, mode='passage')
+        if new_importance is not None:
+            updates['importance'] = new_importance
+        if not updates:
+            return False
+        self.storage.update_episode(episode_id, updates, new_vector=new_vector)
+        return True
+
+    def forget(self, episode_id: int):
+        """Soft-delete an episode (sets invalidated_at)."""
+        self.storage.invalidate_episode(episode_id)
+
+    def get_history(self, episode_id: int) -> List[dict]:
+        """Return the full supersession chain for an episode."""
+        return self.storage.get_supersession_chain(episode_id)
+
+    # =========================================================
+    # PHASE 3: REFLECTION API
+    # =========================================================
+
+    def reflect(self) -> dict:
+        """
+        Post-session reflection pass.
+
+        1. Scan for contradictions → enqueue review items
+        2. Recalibrate importance for frequently-accessed episodes
+        3. Flag ambiguous low-importance episodes
+        4. Run consolidation sweep (explicit call)
+
+        Returns a stats dict.
+        """
+        from .reflect import scan_contradictions, recalibrate_importance, detect_ambiguity
+
+        stats = {
+            'contradictions_found': 0,
+            'importance_recalibrated': 0,
+            'ambiguous_flagged': 0,
+            'consolidation': {},
+        }
+
+        # 1. Contradiction scanning
+        try:
+            contradictions = scan_contradictions(self.storage, self.embedder)
+            for c in contradictions:
+                self.storage.enqueue_review(
+                    episode_id=c['older_episode_id'],
+                    review_type='contradiction',
+                    reason=f"Contradicts episode {c['newer_episode_id']} "
+                           f"(sim={c['similarity']:.2f}, overlap={c['word_overlap']:.2f})",
+                    priority=c['similarity'],
+                )
+            stats['contradictions_found'] = len(contradictions)
+        except Exception as e:
+            logger.warning(f"reflect: contradiction scan failed: {e}")
+
+        # 2. Importance recalibration
+        try:
+            suggestions = recalibrate_importance(self.storage)
+            for s in suggestions:
+                self.storage.update_episode(
+                    s['episode_id'], {'importance': s['suggested']}
+                )
+            stats['importance_recalibrated'] = len(suggestions)
+        except Exception as e:
+            logger.warning(f"reflect: importance recalibration failed: {e}")
+
+        # 3. Ambiguity flagging
+        try:
+            ambiguous = detect_ambiguity(self.storage)
+            for a in ambiguous:
+                self.storage.enqueue_review(
+                    episode_id=a['episode_id'],
+                    review_type='ambiguous',
+                    reason=f"Accessed {a['access_count']}x but importance={a['importance']:.2f}",
+                    priority=0.3,
+                )
+            stats['ambiguous_flagged'] = len(ambiguous)
+        except Exception as e:
+            logger.warning(f"reflect: ambiguity detection failed: {e}")
+
+        # 4. Consolidation
+        try:
+            consolidation_stats = self.consolidate()
+            stats['consolidation'] = consolidation_stats
+        except Exception as e:
+            logger.warning(f"reflect: consolidation failed: {e}")
+
+        logger.info(f"Reflection complete: {stats}")
+        return stats
+
+    def get_pending_reviews(self, limit: int = 10) -> List[dict]:
+        """Return open review items from the review queue."""
+        return self.storage.get_pending_reviews(limit=limit)
+
+    def resolve_review(self, review_id: int, action: str,
+                       update_content: str = None,
+                       update_importance: float = None):
+        """Resolve a review item. Actions: update, delete, pin, keep_both, defer."""
+        episode_id = None
+        reviews = self.storage.get_pending_reviews(limit=10000)
+        for r in reviews:
+            if r['id'] == review_id:
+                episode_id = r['episode_id']
+                break
+
+        if episode_id is not None:
+            if action == 'update':
+                self.update(episode_id, new_content=update_content,
+                            new_importance=update_importance)
+            elif action == 'delete':
+                self.forget(episode_id)
+            elif action == 'pin':
+                self.pin(episode_id)
+
+        self.storage.resolve_review(review_id, action)
     
     def get_stats(self) -> dict:
         """Return comprehensive system statistics."""
