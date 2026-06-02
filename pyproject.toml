@@ -39,14 +39,20 @@ dependencies = [
 dev = ["pytest>=8", "pytest-asyncio>=0.23", "httpx>=0.27"]
 
 [project.urls]
-Homepage = "https://github.com/MohamedMohamed/arn-v9"
-Issues = "https://github.com/MohamedMohamed/arn-v9/issues"
+Homepage = "https://github.com/tuuhe99-del/ARN-Adaptive-Reasoning-Network"
+Issues = "https://github.com/tuuhe99-del/ARN-Adaptive-Reasoning-Network/issues"
 
 [project.scripts]
 arn = "arn_v9.cli:main"
 
 [tool.setuptools]
-packages = ["arn_v9", "arn_v9.core", "arn_v9.storage", "arn_v9.api", "arn_v9.scripts", "arn_v9.tests", "arn_v9.benchmarks"]
+packages = [
+    "arn_v9", "arn_v9.core", "arn_v9.storage",
+    "arn_v9.api", "arn_v9.scripts", "arn_v9.tests", "arn_v9.benchmarks"
+]
 
 [tool.setuptools.package-data]
-arn_v9 = ["requirements.txt"]
+arn_v9 = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "arn_v9/tests"]

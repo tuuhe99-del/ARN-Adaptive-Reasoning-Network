@@ -49,6 +49,18 @@ arn_data/
 *.db-shm
 *.npy
 
+# Planning/research docs and internal scripts
+research/
+tasks/
+scripts/
+collab_ui.py
+test_live_sessions.py
+arn-setup
+arn-switch-model
+*_research_roadmap.md
+foundation_*_report.md
+research_briefs.md
+
 # Model cache
 .cache/
 huggingface/

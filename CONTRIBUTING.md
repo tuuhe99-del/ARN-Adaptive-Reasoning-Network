@@ -1,60 +1,84 @@
-# Contributing
+# Contributing to ARN
 
-Thanks for looking. This project is open to contributions of pretty much any kind.
+## Setup
 
-## Before you start
+```bash
+git clone https://github.com/tuuhe99-del/ARN-Adaptive-Reasoning-Network.git
+cd ARN-Adaptive-Reasoning-Network
+pip install -e ".[dev]"
+python -m pytest tests/ -v
+```
 
-This is a student project. I'm not a seasoned maintainer and response times will be what they are. But I'll take every PR seriously and give real feedback.
+## Running tests
 
-## How to contribute
+```bash
+python -m pytest tests/ -v                              # all integration tests
+python -m pytest tests/test_procedural.py -v            # procedural memory
+python -m pytest tests/test_openclaw_integration.py -v  # OpenClaw pipeline
+python -m pytest arn_v9/tests/test_all.py -v            # unit tests
+```
 
-**Bug reports:** use the issue template. The more specific the repro, the faster I can look at it.
+Tests run in degraded mode (no embedding model) in offline environments.
+Tests requiring real embeddings are automatically skipped via `@pytest.mark.skipif`.
 
-**Feature ideas:** open an issue first before coding. I don't want anyone wasting time building something I'd push back on. If the issue gets a thumbs up from me, go ahead and PR.
+## Architecture
 
-**Pull requests:**
+See `docs/build-session-report.md` for a full explanation of every system and
+the reasoning behind each design decision.
 
-1. Fork the repo
-2. Make a branch named something descriptive (`fix/vec-index-collision`, `feat/multilingual-embeddings`)
-3. Write or update tests for your change
-4. Run the test suite: `python arn_v9/tests/test_all.py`
-5. Run the stress test if your change touches memory behavior: `python arn_v9/benchmarks/stress_test.py nano`
-6. Open the PR
+Core pipeline:
+```
+perceive(text)
+  → encode (all-MiniLM-L6-v2, 384-dim)
+  → store (episodes + vec0 + FTS5 + entities)
+  → working memory update
+
+recall(query)
+  → encode query
+  → KNN (sqlite-vec) + FTS5 (BM25) + entity matching
+  → Reciprocal Rank Fusion
+  → composite score (recency + importance + frequency + pin boost)
+  → MMR reranking
+  → score-gap cutoff
+
+reflect(session_id)
+  → contradiction scan
+  → importance recalibration
+  → procedure extraction (complexity >= 8.0)
+  → consolidation
+```
+
+## What needs help
+
+1. **LoCoMo / LongMemEval benchmarks** — run ARN against published long-term
+   memory benchmarks. This is the most credible way to demonstrate recall quality.
+
+2. **NLI-based contradiction detection** — replace the cosine+overlap heuristic
+   with a small cross-encoder. The current approach generates false positives on
+   paraphrases.
+
+3. **Multilingual support** — swap `all-MiniLM-L6-v2` for
+   `paraphrase-multilingual-MiniLM-L12-v2`, add non-English recall tests.
+
+4. **LangChain / CrewAI adapters** — thin wrappers mapping ARN's
+   `perceive()`/`recall()` interface to other agent framework abstractions.
+
+5. **Async consolidation** — runs synchronously today. A background priority
+   queue would help high-throughput setups without blocking agent responses.
 
 ## Code style
 
-- Python 3.10+
-- Keep it readable. If a comment explains *why*, keep it. If it explains *what* the code does, rewrite the code to be clearer.
-- I try to match the existing style in each file. If you see inconsistency, that's on me, feel free to fix it.
-- No formatter is enforced right now but `black` would be fine if you want to use it.
+- Type hints on all public signatures
+- One-line docstrings where the name isn't self-explanatory
+- Comments explain WHY, not WHAT
+- Tests must pass in degraded mode (offline, no model download)
 
-## Testing
+## Before opening a PR
 
-There are two test tiers:
+- All tests pass: `python -m pytest tests/ -v`
+- No new dependencies without discussion (each one multiplies the Pi 5 footprint)
+- Schema changes need a migration in `_migrate_schema()` with idempotent
+  `ALTER TABLE ... ADD COLUMN` guards
 
-- **Plumbing** — runs without `sentence-transformers`, tests storage, working memory, degraded-mode detection
-- **Semantic** — requires the embedding model, tests actual recall quality
-
-The CI runs both. If your change breaks either, fix it before merging.
-
-## Things I'd love help with
-
-See the "Things I think would be valuable next" section in the README. Mem0/Zep comparison benchmarks, async consolidation, and cross-agent sharing are probably the highest value.
-
-## Questions
-
-Just open an issue with the `question` label. Or if you want to reach me privately, my contact info is on my GitHub profile.
-
-## Licensing note for contributors
-
-This project is under **PolyForm Small Business 1.0.0**, not MIT. When you submit a PR, your contribution becomes part of the project under the same license.
-
-What this means in practice:
-
-- You still own the copyright to your contribution
-- Your code is licensed to everyone under PolyForm Small Business terms (free for small users, paid for big companies)
-- If I ever need to dual-license the project (say, a company wants a commercial license that includes your code), I may need your permission
-
-If any of this is a dealbreaker, open an issue before submitting code and we'll sort it out.
-
-— Mohamed
+Open an issue first for anything touching the schema, embedding pipeline, or
+retrieval ranking — those have non-obvious interactions.
