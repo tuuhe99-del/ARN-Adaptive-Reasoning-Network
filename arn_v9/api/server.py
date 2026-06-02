@@ -315,6 +315,7 @@ def _run_consolidation_pass() -> None:
 # =========================================================
 
 DATA_ROOT = os.environ.get("ARN_DATA_ROOT", os.path.expanduser("~/.arn_data"))
+DEFAULT_AGENT_ID = os.environ.get("ARN_AGENT_ID", "default")
 API_KEY = os.environ.get("ARN_API_KEY", None)  # Set to enable auth
 MAX_AGENTS = int(os.environ.get("ARN_MAX_AGENTS", "100"))
 RATE_LIMIT_RPM = int(os.environ.get("ARN_RATE_LIMIT_RPM", "300"))  # requests per minute
@@ -782,13 +783,30 @@ async def health():
                 status = "degraded"
                 break
     
-    return HealthResponse(
-        status=status,
-        version="9.0.0",
-        uptime_seconds=round(time.time() - start_time, 1),
-        agents_loaded=pool.loaded_count if pool else 0,
-        data_root=DATA_ROOT,
-    )
+    # Include stats for the default agent if available
+    episodes = 0
+    sessions = 0
+    db_size_mb = 0.0
+    try:
+        if pool:
+            plugin = pool.get(DEFAULT_AGENT_ID)
+            storage = plugin._arn.storage
+            episodes = storage.count_episodes()
+            sessions = storage.count_sessions()
+            db_size_mb = round(storage.get_storage_stats()['total_size_mb'], 2)
+    except Exception:
+        pass
+
+    return {
+        "status": status,
+        "version": "0.10.0",
+        "uptime_seconds": round(time.time() - start_time, 1),
+        "agents_loaded": pool.loaded_count if pool else 0,
+        "data_root": DATA_ROOT,
+        "episodes": episodes,
+        "sessions": sessions,
+        "db_size_mb": db_size_mb,
+    }
 
 
 @app.post("/v1/memory/store", response_model=StoreResponse,
@@ -1560,6 +1578,283 @@ async def inject_memories(req: InjectRequest):
 
 
 # =========================================================
+# PLUGIN-FACING ENDPOINTS (no agent_id — use DEFAULT_AGENT_ID)
+# These are consumed by the OpenClaw plugin running locally.
+# =========================================================
+
+# Role → importance defaults
+_ROLE_IMPORTANCE: dict = {
+    "user_identity": 0.9,
+    "semantic": 0.8,
+    "user": 0.6,
+    "episodic": 0.5,
+    "assistant": 0.5,
+    "tool_call": 0.4,
+    "tool_result": 0.4,
+    "compaction_marker": 0.3,
+}
+
+
+def _age_label(created_at: float) -> str:
+    """Human-readable relative age for an episode."""
+    delta = time.time() - created_at
+    if delta < 3600:
+        mins = int(delta / 60)
+        return f"{mins} minute{'s' if mins != 1 else ''} ago" if mins > 0 else "just now"
+    if delta < 86400:
+        hrs = int(delta / 3600)
+        return f"{hrs} hour{'s' if hrs != 1 else ''} ago"
+    days = int(delta / 86400)
+    if days < 14:
+        return f"{days} day{'s' if days != 1 else ''} ago"
+    weeks = int(days / 7)
+    return f"{weeks} week{'s' if weeks != 1 else ''} ago"
+
+
+class PerceiveRequest(BaseModel):
+    content: str = Field(..., min_length=1, max_length=20000)
+    role: str = Field("user", max_length=32)
+    importance: Optional[float] = Field(None, ge=0.0, le=1.0)
+    metadata: dict = Field(default_factory=dict)
+    session_id: Optional[str] = Field(None, max_length=128)
+
+
+class PluginRecallRequest(BaseModel):
+    query: str = Field(..., min_length=1, max_length=5000)
+    top_k: int = Field(10, ge=1, le=50)
+    role_filter: Optional[List[str]] = None
+    session_id: Optional[str] = None
+    include_metadata: bool = False
+
+
+class SessionStartRequest(BaseModel):
+    session_id: str = Field(..., max_length=128)
+    reason: Optional[str] = None
+    timestamp: Optional[float] = None
+
+
+class SessionEndRequest(BaseModel):
+    session_id: str = Field(..., max_length=128)
+    reason: Optional[str] = None
+    timestamp: Optional[float] = None
+
+
+class PinRequest(BaseModel):
+    episode_id: int
+
+
+class ForgetRequest(BaseModel):
+    episode_id: int
+
+
+class ResolveReviewRequest(BaseModel):
+    review_id: int
+    resolution: str = Field(..., max_length=256)
+    action: str = Field("keep_both", max_length=32)
+
+
+@app.post("/perceive")
+async def plugin_perceive(req: PerceiveRequest):
+    """Store a memory from the OpenClaw plugin."""
+    plugin = pool.get(DEFAULT_AGENT_ID)
+    imp = req.importance if req.importance is not None else _ROLE_IMPORTANCE.get(req.role, 0.5)
+    result = await asyncio.to_thread(
+        plugin._arn.storage.store_episode,
+        content=req.content,
+        vector=plugin._arn.embedder.encode(req.content, mode="passage"),
+        importance=imp,
+        source=req.role,
+        memory_type="episode",
+        role=req.role,
+        metadata=req.metadata,
+        session_id=req.session_id,
+    )
+    return {"stored": True, "episode_id": result}
+
+
+@app.post("/recall")
+async def plugin_recall(req: PluginRecallRequest):
+    """Recall memories for the OpenClaw plugin."""
+    plugin = pool.get(DEFAULT_AGENT_ID)
+    arn = plugin._arn
+    storage = arn.storage
+
+    query_vec = await asyncio.to_thread(arn.embedder.encode, req.query, "query")
+
+    # Build filtered candidate set
+    knn = await asyncio.to_thread(storage.knn_search, query_vec, req.top_k * 4)
+    fts = await asyncio.to_thread(storage.fts_search, req.query, req.top_k * 4)
+    ent = await asyncio.to_thread(storage.search_entities, req.query, req.top_k * 4)
+
+    from arn_v9.core.retrieval import fuse_rrf, recency_score, score_gap_cutoff
+    rrf = fuse_rrf(knn, fts, ent)
+
+    candidate_ids = list(rrf.keys())
+    episodes = {ep['id']: ep for ep in storage.get_episodes_by_ids(candidate_ids)}
+
+    results = []
+    now = time.time()
+    for ep_id, rrf_score in rrf.items():
+        ep = episodes.get(ep_id)
+        if ep is None or ep.get('invalidated_at') is not None:
+            continue
+        if req.role_filter and ep.get('role', 'user') not in req.role_filter:
+            continue
+        if req.session_id and ep.get('session_id') != req.session_id:
+            continue
+
+        rec = recency_score(ep['created_at']) if not ep.get('pinned') else 1.0
+        pin_boost = 0.15 if ep.get('pinned') else 0.0
+        import math
+        freq = math.log1p(ep.get('access_count', 0)) * 0.05
+        score = rrf_score + rec * 0.3 + ep['importance'] * 0.15 + freq + pin_boost
+
+        item = {
+            'id': ep['id'],
+            'content': ep['content'],
+            'score': round(score, 4),
+            'role': ep.get('role', 'user'),
+            'importance': ep['importance'],
+            'pinned': ep.get('pinned', False),
+            'created_at': ep['created_at'],
+            'age_label': _age_label(ep['created_at']),
+            'session_id': ep.get('session_id'),
+        }
+        if req.include_metadata:
+            item['metadata'] = ep.get('metadata', {})
+        results.append(item)
+
+    results.sort(key=lambda r: r['score'], reverse=True)
+    results = results[:req.top_k]
+
+    # Increment access counts
+    for r in results:
+        await asyncio.to_thread(storage.update_episode_access, r['id'])
+
+    return {"results": results, "count": len(results)}
+
+
+@app.post("/session/start")
+async def session_start(req: SessionStartRequest):
+    """Start a session — called by OpenClaw plugin on session_start hook."""
+    plugin = pool.get(DEFAULT_AGENT_ID)
+    session = await asyncio.to_thread(
+        plugin._arn.storage.create_session,
+        req.session_id, req.reason
+    )
+    return {"session_id": req.session_id, "started_at": session['started_at']}
+
+
+@app.post("/session/end")
+async def session_end(req: SessionEndRequest):
+    """End a session and trigger reflect()."""
+    plugin = pool.get(DEFAULT_AGENT_ID)
+    storage = plugin._arn.storage
+
+    session = await asyncio.to_thread(storage.end_session, req.session_id, req.reason)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    # Run post-session reflection in background thread
+    reflect_stats = await asyncio.to_thread(plugin._arn.reflect)
+
+    reviews = await asyncio.to_thread(storage.get_pending_reviews, 5)
+    return {
+        "session_id": req.session_id,
+        "episode_count": session['episode_count'],
+        "reflect": reflect_stats,
+        "review_items": reviews,
+    }
+
+
+@app.get("/sessions/recent")
+async def sessions_recent(limit: int = 5):
+    """Get most recent sessions."""
+    plugin = pool.get(DEFAULT_AGENT_ID)
+    sessions = await asyncio.to_thread(plugin._arn.storage.get_recent_sessions, limit)
+    return {"sessions": sessions}
+
+
+@app.get("/session/{session_id}")
+async def session_detail(session_id: str):
+    """Get session detail with episode breakdown."""
+    plugin = pool.get(DEFAULT_AGENT_ID)
+    storage = plugin._arn.storage
+    session = await asyncio.to_thread(storage.get_session, session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    episodes = await asyncio.to_thread(storage.get_session_episodes, session_id)
+    role_counts: dict = {}
+    for ep in episodes:
+        role = ep.get('role', 'user')
+        role_counts[role] = role_counts.get(role, 0) + 1
+
+    return {**session, "role_counts": role_counts, "episodes": len(episodes)}
+
+
+@app.post("/pin")
+async def plugin_pin(req: PinRequest):
+    """Pin an episode so it survives decay and consolidation."""
+    plugin = pool.get(DEFAULT_AGENT_ID)
+    ok = await asyncio.to_thread(plugin._arn.storage.set_pinned, req.episode_id, True)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Episode not found")
+    return {"pinned": True, "episode_id": req.episode_id}
+
+
+@app.post("/unpin")
+async def plugin_unpin(req: PinRequest):
+    """Unpin an episode."""
+    plugin = pool.get(DEFAULT_AGENT_ID)
+    ok = await asyncio.to_thread(plugin._arn.storage.set_pinned, req.episode_id, False)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Episode not found")
+    return {"pinned": False, "episode_id": req.episode_id}
+
+
+@app.post("/forget")
+async def plugin_forget(req: ForgetRequest):
+    """Soft-delete (invalidate) an episode."""
+    plugin = pool.get(DEFAULT_AGENT_ID)
+    await asyncio.to_thread(plugin._arn.storage.invalidate_episode, req.episode_id)
+    return {"forgotten": True, "episode_id": req.episode_id}
+
+
+@app.get("/reviews/pending")
+async def reviews_pending(max: int = 3):
+    """Get pending review items from the memory review queue."""
+    plugin = pool.get(DEFAULT_AGENT_ID)
+    items = await asyncio.to_thread(plugin._arn.storage.get_pending_reviews, max)
+    return {"items": items, "count": len(items)}
+
+
+@app.post("/reviews/resolve")
+async def reviews_resolve(req: ResolveReviewRequest):
+    """Resolve a review item."""
+    plugin = pool.get(DEFAULT_AGENT_ID)
+    arn = plugin._arn
+    storage = arn.storage
+
+    reviews = await asyncio.to_thread(storage.get_pending_reviews, 1000)
+    review = next((r for r in reviews if r['id'] == req.review_id), None)
+    if review is None:
+        raise HTTPException(status_code=404, detail="Review item not found")
+
+    ep_id = review['episode_id']
+    action = req.action
+
+    if action == 'delete':
+        await asyncio.to_thread(storage.invalidate_episode, ep_id)
+    elif action == 'pin':
+        await asyncio.to_thread(storage.set_pinned, ep_id, True)
+    # 'keep_both', 'defer', 'update' — no structural change for now
+
+    await asyncio.to_thread(storage.resolve_review, req.review_id, f"{action}: {req.resolution}")
+    return {"resolved": True, "review_id": req.review_id, "action": action}
+
+
+# =========================================================
 # ERROR HANDLERS
 # =========================================================
 
@@ -1576,16 +1871,104 @@ async def global_exception_handler(request: Request, exc: Exception):
 # ENTRYPOINT
 # =========================================================
 
-def main():
+_ARN_DIR = _Path.home() / ".arn"
+_PID_FILE = _ARN_DIR / "arn.pid"
+_LOG_FILE = _ARN_DIR / "arn.log"
+
+
+def _start_daemon(host: str, port: int):
+    """Fork to background, write PID file, redirect stdio."""
+    _ARN_DIR.mkdir(parents=True, exist_ok=True)
+    pid = os.fork()
+    if pid > 0:
+        # Parent: write PID and exit
+        _PID_FILE.write_text(str(pid))
+        print(f"ARN daemon started (PID {pid}, port {port})")
+        print(f"Logs: {_LOG_FILE}")
+        os._exit(0)
+    # Child: detach from terminal
+    os.setsid()
+    log_fd = open(_LOG_FILE, "a")
+    os.dup2(log_fd.fileno(), sys.stdout.fileno())
+    os.dup2(log_fd.fileno(), sys.stderr.fileno())
     import uvicorn
+    uvicorn.run("arn_v9.api.server:app", host=host, port=port, log_level="info")
+
+
+def _stop_daemon():
+    """Read PID file and kill the daemon."""
+    if not _PID_FILE.exists():
+        print("ARN daemon is not running (no PID file)")
+        return
+    pid = int(_PID_FILE.read_text().strip())
+    try:
+        import signal
+        os.kill(pid, signal.SIGTERM)
+        _PID_FILE.unlink(missing_ok=True)
+        print(f"ARN daemon stopped (PID {pid})")
+    except ProcessLookupError:
+        print(f"ARN daemon not running (stale PID {pid})")
+        _PID_FILE.unlink(missing_ok=True)
+    except Exception as e:
+        print(f"Error stopping daemon: {e}")
+
+
+def _daemon_status(port: int):
+    """Check whether the daemon is running and print stats."""
+    if not _PID_FILE.exists():
+        print("ARN daemon: stopped")
+        return
+    pid = int(_PID_FILE.read_text().strip())
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        print(f"ARN daemon: stopped (stale PID {pid})")
+        _PID_FILE.unlink(missing_ok=True)
+        return
+    try:
+        import urllib.request, json as _json
+        resp = urllib.request.urlopen(f"http://localhost:{port}/v1/health", timeout=2)
+        stats = _json.loads(resp.read())
+        print(f"ARN daemon: running (PID {pid}, port {port})")
+        print(f"  Episodes:    {stats.get('episodes', '?')}")
+        print(f"  Sessions:    {stats.get('sessions', '?')}")
+        print(f"  DB size:     {stats.get('db_size_mb', '?')} MB")
+        print(f"  Uptime:      {stats.get('uptime_seconds', '?')}s")
+    except Exception:
+        print(f"ARN daemon: running (PID {pid}) — API not responding on port {port}")
+
+
+def main():
+    import argparse
+    import uvicorn
+
+    parser = argparse.ArgumentParser(description="ARN memory server")
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=int(os.environ.get("ARN_PORT", "7900")))
+    parser.add_argument("--daemon", action="store_true", help="Run as background daemon")
+    parser.add_argument("--stop", action="store_true", help="Stop daemon")
+    parser.add_argument("--status", action="store_true", help="Show daemon status")
+    args = parser.parse_args()
+
     logging.basicConfig(level=logging.INFO)
-    uvicorn.run(
-        "arn_v9.api.server:app",
-        host="0.0.0.0",
-        port=int(os.environ.get("ARN_PORT", "8742")),
-        reload=False,
-        log_level="info",
-    )
+
+    if args.stop:
+        _stop_daemon()
+    elif args.status:
+        _daemon_status(args.port)
+    elif args.daemon:
+        if not hasattr(os, 'fork'):
+            print("--daemon is not supported on this platform. Run without --daemon.")
+            sys.exit(1)
+        _start_daemon(args.host, args.port)
+    else:
+        uvicorn.run(
+            "arn_v9.api.server:app",
+            host=args.host,
+            port=args.port,
+            reload=False,
+            log_level="info",
+        )
 
 
 if __name__ == "__main__":

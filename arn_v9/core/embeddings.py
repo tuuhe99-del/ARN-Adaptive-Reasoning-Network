@@ -115,26 +115,21 @@ class EmbeddingEngine:
                 os.close(_old_stdout_fd)
                 sys.stdout = _old_out
                 sys.stderr = _old_err
-            logger.info(
-                f"Loaded {self._tier} model — dim={self._config['dim']}, "
-                f"~{self._config['approx_ram_mb']}MB RAM"
-            )
+            logger.info(f"Loaded {MODEL_NAME} (dim={_EMBEDDING_DIM})")
         except ImportError:
             self._model = None
             self._use_model = False
             logger.critical(
                 "sentence-transformers is NOT installed. "
                 "ARN is running in DEGRADED MODE with lexical hash vectors. "
-                "Recall quality is reduced until sentence-transformers is available. "
                 "Install with: pip install sentence-transformers"
             )
         except Exception as e:
             self._model = None
             self._use_model = False
             logger.critical(
-                f"Failed to load embedding model '{self._config['name']}': {e}. "
-                "ARN is running in DEGRADED MODE with lexical hash vectors. "
-                "Recall quality is reduced until the model loads correctly."
+                f"Failed to load embedding model '{MODEL_NAME}': {e}. "
+                "ARN is running in DEGRADED MODE with lexical hash vectors."
             )
 
     def _resolve_local_model_path(self, model_name: str) -> str:

@@ -1,0 +1,16 @@
+{
+  "name": "@arn-memory/openclaw-plugin",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "./index.ts",
+  "openclaw": {
+    "extensions": ["./index.ts"]
+  },
+  "dependencies": {
+    "@sinclair/typebox": "^0.34.49",
+    "openclaw": "^2026.4.24"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.3"
+  }
+}

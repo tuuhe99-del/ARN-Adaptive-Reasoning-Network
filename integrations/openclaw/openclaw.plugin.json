@@ -1,0 +1,31 @@
+{
+  "id": "arn-memory",
+  "name": "ARN Adaptive Memory",
+  "description": "Replaces OpenClaw built-in memory. Auto-injects relevant memories every turn via before_prompt_build. Captures all messages, tool calls, and outputs.",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "arnApiUrl": {
+        "type": "string",
+        "default": "http://localhost:7900"
+      },
+      "maxInjectedMemories": {
+        "type": "number",
+        "default": 8
+      },
+      "captureToolCalls": {
+        "type": "boolean",
+        "default": true
+      },
+      "captureAssistant": {
+        "type": "boolean",
+        "default": true
+      }
+    },
+    "additionalProperties": false
+  },
+  "activation": { "onStartup": true },
+  "contracts": {
+    "tools": ["arn_recall", "arn_pin", "arn_forget", "arn_sessions", "arn_review"]
+  }
+}

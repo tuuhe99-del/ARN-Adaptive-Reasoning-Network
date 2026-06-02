@@ -29,7 +29,7 @@ from ..core.embeddings import EMBEDDING_DIM
 
 logger = logging.getLogger("arn.storage")
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 class _ThreadLocalConnection:
@@ -145,7 +145,21 @@ class StorageEngine:
                 valid_from REAL,
                 valid_until REAL,
                 supersedes INTEGER,
-                pinned INTEGER DEFAULT 0
+                pinned INTEGER DEFAULT 0,
+                role TEXT DEFAULT 'user',
+                metadata TEXT DEFAULT '{}',
+                session_id TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                id TEXT PRIMARY KEY,
+                started_at REAL NOT NULL,
+                ended_at REAL,
+                reason_start TEXT,
+                reason_end TEXT,
+                episode_count INTEGER DEFAULT 0,
+                metadata TEXT DEFAULT '{}'
             )
         """)
         conn.execute("""
@@ -214,6 +228,9 @@ class StorageEngine:
             "CREATE INDEX IF NOT EXISTS idx_episodes_user ON episodes(user_id)",
             "CREATE INDEX IF NOT EXISTS idx_episodes_memory_type ON episodes(memory_type)",
             "CREATE INDEX IF NOT EXISTS idx_episodes_pinned ON episodes(pinned)",
+            "CREATE INDEX IF NOT EXISTS idx_episodes_session ON episodes(session_id)",
+            "CREATE INDEX IF NOT EXISTS idx_episodes_role ON episodes(role)",
+            "CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_semantic_confidence ON semantic_nodes(confidence DESC)",
             "CREATE INDEX IF NOT EXISTS idx_links_from ON memory_links(from_episode_id)",
             "CREATE INDEX IF NOT EXISTS idx_links_to ON memory_links(to_episode_id)",
@@ -336,6 +353,9 @@ class StorageEngine:
 
         if from_version < 6:
             self._migrate_v5_to_v6(conn)
+
+        if from_version < 7:
+            self._migrate_v6_to_v7(conn)
 
         conn.commit()
 
@@ -472,6 +492,41 @@ class StorageEngine:
         conn.commit()
         logger.info("Migrated schema v5 → v6 (bi-temporal, entities, review queue)")
 
+    def _migrate_v6_to_v7(self, conn: sqlite3.Connection):
+        """v6 → v7: sessions table, role/metadata/session_id on episodes."""
+        for sql in [
+            "ALTER TABLE episodes ADD COLUMN role TEXT DEFAULT 'user'",
+            "ALTER TABLE episodes ADD COLUMN metadata TEXT DEFAULT '{}'",
+            "ALTER TABLE episodes ADD COLUMN session_id TEXT",
+        ]:
+            try:
+                conn.execute(sql)
+            except Exception:
+                pass
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                id TEXT PRIMARY KEY,
+                started_at REAL NOT NULL,
+                ended_at REAL,
+                reason_start TEXT,
+                reason_end TEXT,
+                episode_count INTEGER DEFAULT 0,
+                metadata TEXT DEFAULT '{}'
+            )
+        """)
+        for idx_sql in [
+            "CREATE INDEX IF NOT EXISTS idx_episodes_session ON episodes(session_id)",
+            "CREATE INDEX IF NOT EXISTS idx_episodes_role ON episodes(role)",
+            "CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC)",
+        ]:
+            try:
+                conn.execute(idx_sql)
+            except Exception:
+                pass
+        conn.commit()
+        logger.info("Migrated schema v6 → v7 (sessions, role-aware episodes)")
+
     # =========================================================
     # EPISODIC MEMORY OPERATIONS
     # =========================================================
@@ -483,7 +538,10 @@ class StorageEngine:
                       expires_at: float = None,
                       user_id: str = None,
                       memory_type: str = 'episode',
-                      valid_from: float = None) -> int:
+                      valid_from: float = None,
+                      role: str = 'user',
+                      metadata: dict = None,
+                      session_id: str = None) -> int:
         """Store a new episodic memory. Returns episode ID."""
         with self._lock:
             conn = self._get_conn()
@@ -496,12 +554,14 @@ class StorageEngine:
                 INSERT INTO episodes
                     (vec_index, content, content_hash, context_json,
                      importance, prediction_error, created_at, source,
-                     expires_at, user_id, memory_type, valid_from)
-                VALUES (-1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     expires_at, user_id, memory_type, valid_from,
+                     role, metadata, session_id)
+                VALUES (-1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 content, c_hash, json.dumps(context or {}),
                 importance, prediction_error, now, source,
                 expires_at, user_id, memory_type, vf,
+                role, json.dumps(metadata or {}), session_id,
             ))
             ep_id = cursor.lastrowid
 
@@ -847,6 +907,89 @@ class StorageEngine:
         conn.commit()
 
     # =========================================================
+    # SESSION MANAGEMENT
+    # =========================================================
+
+    def create_session(self, session_id: str, reason_start: str = None,
+                       metadata: dict = None) -> dict:
+        """Create a new session record."""
+        conn = self._get_conn()
+        now = time.time()
+        conn.execute(
+            "INSERT OR IGNORE INTO sessions (id, started_at, reason_start, metadata) "
+            "VALUES (?, ?, ?, ?)",
+            (session_id, now, reason_start, json.dumps(metadata or {}))
+        )
+        conn.commit()
+        return self.get_session(session_id)
+
+    def end_session(self, session_id: str, reason_end: str = None) -> Optional[dict]:
+        """Mark session as ended; update episode_count."""
+        conn = self._get_conn()
+        now = time.time()
+        row = conn.execute(
+            "SELECT episode_count FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        # Recount episodes for accuracy
+        ep_count = conn.execute(
+            "SELECT COUNT(*) FROM episodes WHERE session_id = ? AND invalidated_at IS NULL",
+            (session_id,)
+        ).fetchone()[0]
+        conn.execute(
+            "UPDATE sessions SET ended_at=?, reason_end=?, episode_count=? WHERE id=?",
+            (now, reason_end, ep_count, session_id)
+        )
+        conn.commit()
+        return self.get_session(session_id)
+
+    def get_session(self, session_id: str) -> Optional[dict]:
+        """Get a session record by ID."""
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT * FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_session(row)
+
+    def get_recent_sessions(self, limit: int = 5) -> List[dict]:
+        """Get most recently started sessions."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT * FROM sessions ORDER BY started_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [self._row_to_session(r) for r in rows]
+
+    def get_session_episodes(self, session_id: str) -> List[dict]:
+        """Get all valid episodes for a session."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT * FROM episodes WHERE session_id = ? AND invalidated_at IS NULL "
+            "ORDER BY created_at",
+            (session_id,)
+        ).fetchall()
+        return [self._row_to_episode(r) for r in rows]
+
+    def _row_to_session(self, row) -> dict:
+        keys = row.keys() if hasattr(row, 'keys') else []
+        return {
+            'id': row['id'],
+            'started_at': row['started_at'],
+            'ended_at': row['ended_at'] if 'ended_at' in keys else None,
+            'reason_start': row['reason_start'] if 'reason_start' in keys else None,
+            'reason_end': row['reason_end'] if 'reason_end' in keys else None,
+            'episode_count': row['episode_count'] if 'episode_count' in keys else 0,
+            'metadata': json.loads(row['metadata']) if 'metadata' in keys and row['metadata'] else {},
+        }
+
+    def count_sessions(self) -> int:
+        conn = self._get_conn()
+        row = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()
+        return row[0] if row else 0
+
+    # =========================================================
     # SEMANTIC MEMORY OPERATIONS
     # =========================================================
 
@@ -1041,6 +1184,9 @@ class StorageEngine:
             'valid_until': row['valid_until'] if 'valid_until' in keys else None,
             'supersedes': row['supersedes'] if 'supersedes' in keys else None,
             'pinned': bool(row['pinned']) if 'pinned' in keys else False,
+            'role': row['role'] if 'role' in keys else 'user',
+            'metadata': json.loads(row['metadata']) if 'metadata' in keys and row['metadata'] else {},
+            'session_id': row['session_id'] if 'session_id' in keys else None,
         }
 
     def _row_to_semantic(self, row) -> dict:

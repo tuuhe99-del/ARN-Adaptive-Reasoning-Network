@@ -790,6 +790,21 @@ def cmd_resolve(args):
 
 def cmd_server(args):
     """Start the HTTP API server."""
+    from arn_v9.api.server import _start_daemon, _stop_daemon, _daemon_status, _ARN_DIR, _PID_FILE
+
+    if getattr(args, 'stop', False):
+        _stop_daemon()
+        return
+    if getattr(args, 'status_check', False):
+        _daemon_status(args.port)
+        return
+    if getattr(args, 'daemon', False):
+        if not hasattr(os, 'fork'):
+            print("--daemon is not supported on Windows. Run without --daemon.")
+            sys.exit(1)
+        _start_daemon(args.host, args.port)
+        return
+
     import uvicorn
     uvicorn.run(
         "arn_v9.api.server:app",
@@ -797,6 +812,131 @@ def cmd_server(args):
         port=args.port,
         workers=1,
     )
+
+
+# ─── OpenClaw integration helpers ────────────────────────────────────────────
+
+def _get_plugin_src() -> Path:
+    return Path(__file__).parent.parent.parent / "integrations" / "openclaw"
+
+
+def _start_daemon_port(port: int = 7900):
+    """Start ARN daemon on given port."""
+    import subprocess
+    src = _get_plugin_src().parent.parent  # repo root
+    subprocess.Popen(
+        [sys.executable, "-m", "arn_v9.api.server", "--daemon", "--port", str(port)],
+        cwd=str(src),
+    )
+
+
+def cmd_connect(args):
+    """Set up ARN as OpenClaw's memory system."""
+    import shutil, subprocess
+
+    if shutil.which("openclaw") is None:
+        print("OpenClaw not found in PATH.")
+        print("Install it first: https://docs.openclaw.ai")
+        sys.exit(1)
+
+    plugin_src = _get_plugin_src()
+    if not plugin_src.exists():
+        print(f"Plugin source not found at {plugin_src}")
+        sys.exit(1)
+
+    # Copy plugin to OpenClaw plugins directory
+    plugin_dest = Path.home() / ".openclaw" / "plugins" / "arn-memory"
+    if plugin_dest.exists():
+        shutil.rmtree(plugin_dest)
+    shutil.copytree(plugin_src, plugin_dest)
+    print(f"✓ Plugin copied to {plugin_dest}")
+
+    # Install npm dependencies
+    result = subprocess.run(["npm", "install"], cwd=str(plugin_dest), capture_output=True, text=True)
+    if result.returncode == 0:
+        print("✓ Dependencies installed")
+    else:
+        print(f"  npm install warning (non-fatal): {result.stderr.strip()[:120]}")
+
+    # Register plugin
+    result = subprocess.run(
+        ["openclaw", "plugins", "install", str(plugin_dest)],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        print(f"Plugin install failed: {result.stderr}")
+        sys.exit(1)
+    print("✓ Plugin registered with OpenClaw")
+
+    # Disable built-in memory
+    subprocess.run(
+        ["openclaw", "config", "set", "plugins.slots.memory", "none"],
+        capture_output=True
+    )
+    subprocess.run(
+        ["openclaw", "config", "set", "memorySearch.enabled", "false"],
+        capture_output=True
+    )
+    print("✓ Built-in memory disabled")
+
+    # Copy SKILL.md to OpenClaw workspace skills
+    skill_src = plugin_src / "SKILL.md"
+    skill_dest = Path.home() / ".openclaw" / "workspace" / "skills" / "arn-memory" / "SKILL.md"
+    skill_dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(skill_src, skill_dest)
+    print(f"✓ SKILL.md installed to {skill_dest}")
+
+    # Start ARN daemon
+    port = getattr(args, 'port', 7900)
+    _start_daemon_port(port)
+    print(f"✓ ARN daemon started on port {port}")
+
+    print()
+    print("ARN is now OpenClaw's memory system.")
+    print("Capturing: messages, outputs, tool calls, sessions")
+    print(f"Database:  {Path.home() / '.arn_data' / 'default' / 'arn_metadata.db'}")
+
+
+def cmd_disconnect(args):
+    """Remove ARN from OpenClaw and restore built-in memory."""
+    import shutil, subprocess
+    from arn_v9.api.server import _stop_daemon
+
+    # Uninstall plugin
+    subprocess.run(
+        ["openclaw", "plugins", "uninstall", "arn-memory"],
+        capture_output=True
+    )
+
+    # Re-enable built-in memory
+    subprocess.run(
+        ["openclaw", "config", "set", "plugins.slots.memory", "memory-core"],
+        capture_output=True
+    )
+    subprocess.run(
+        ["openclaw", "config", "set", "memorySearch.enabled", "true"],
+        capture_output=True
+    )
+
+    # Stop daemon
+    _stop_daemon()
+
+    # Remove plugin files
+    plugin_dest = Path.home() / ".openclaw" / "plugins" / "arn-memory"
+    if plugin_dest.exists():
+        shutil.rmtree(plugin_dest)
+
+    print("✓ ARN disconnected from OpenClaw")
+    print("  Built-in memory restored")
+    config = get_config()
+    print(f"  ARN data preserved at {config['data_dir']}")
+
+
+def cmd_arn_status(args):
+    """Check ARN daemon status and stats."""
+    from arn_v9.api.server import _daemon_status, _PID_FILE
+    port = getattr(args, 'port', 7900)
+    _daemon_status(port)
 
 
 # ═══════════════════════════════════════════
@@ -881,7 +1021,10 @@ Quick start:
     # ─── server ───
     p_server = sub.add_parser('server', help='Start the HTTP API server')
     p_server.add_argument('--host', default='0.0.0.0', help='Bind host (default: 0.0.0.0)')
-    p_server.add_argument('--port', '-p', type=int, default=8742, help='Port (default: 8742)')
+    p_server.add_argument('--port', '-p', type=int, default=7900, help='Port (default: 7900)')
+    p_server.add_argument('--daemon', action='store_true', help='Run as background daemon')
+    p_server.add_argument('--stop', action='store_true', help='Stop running daemon')
+    p_server.add_argument('--status_check', action='store_true', help='Show daemon status')
     p_server.set_defaults(func=cmd_server)
 
     # ─── collab ───
@@ -1034,6 +1177,22 @@ Quick start:
     p_import.add_argument('--file', '-f', required=True,
                           help='JSON file to import')
     p_import.set_defaults(func=cmd_import)
+
+    # ─── connect ───
+    p_connect = sub.add_parser('connect', help='Set up ARN as OpenClaw memory system')
+    p_connect.add_argument('--port', type=int, default=7900,
+                           help='Port for ARN daemon (default: 7900)')
+    p_connect.set_defaults(func=cmd_connect)
+
+    # ─── disconnect ───
+    p_disconnect = sub.add_parser('disconnect', help='Remove ARN from OpenClaw, restore built-in memory')
+    p_disconnect.set_defaults(func=cmd_disconnect)
+
+    # ─── status ───
+    p_status = sub.add_parser('status', help='Check ARN daemon status and stats')
+    p_status.add_argument('--port', type=int, default=7900,
+                          help='Port to check (default: 7900)')
+    p_status.set_defaults(func=cmd_arn_status)
 
     args = parser.parse_args()
     args.func(args)
