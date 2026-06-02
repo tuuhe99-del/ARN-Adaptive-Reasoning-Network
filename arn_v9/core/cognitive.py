@@ -882,23 +882,32 @@ class ARNv9:
     # PHASE 3: REFLECTION API
     # =========================================================
 
-    def reflect(self) -> dict:
+    def reflect(self, session_id: str = None) -> dict:
         """
         Post-session reflection pass.
 
         1. Scan for contradictions → enqueue review items
         2. Recalibrate importance for frequently-accessed episodes
         3. Flag ambiguous low-importance episodes
-        4. Run consolidation sweep (explicit call)
+        4. Extract procedural memory if session complexity meets threshold
+        5. Run consolidation sweep (explicit call)
 
+        Pass session_id to enable procedure extraction and effectiveness tracking.
         Returns a stats dict.
         """
         from .reflect import scan_contradictions, recalibrate_importance, detect_ambiguity
+        from .procedural import (
+            extract_procedure, find_similar_procedures,
+            compute_session_error_rate, compute_effectiveness_deltas,
+            apply_effectiveness_updates,
+        )
 
         stats = {
             'contradictions_found': 0,
             'importance_recalibrated': 0,
             'ambiguous_flagged': 0,
+            'procedure_extracted': None,
+            'effectiveness_updates': 0,
             'consolidation': {},
         }
 
@@ -942,7 +951,58 @@ class ARNv9:
         except Exception as e:
             logger.warning(f"reflect: ambiguity detection failed: {e}")
 
-        # 4. Consolidation
+        # 4. Procedural memory extraction (requires session_id)
+        if session_id:
+            try:
+                session_eps = self.storage.get_session_episodes(session_id)
+                new_proc_id = extract_procedure(
+                    self.storage, self.embedder, session_eps, session_id
+                )
+                if new_proc_id is not None:
+                    stats['procedure_extracted'] = new_proc_id
+                    # Check for similar existing procedures → supersede chain
+                    new_ep = self.storage.get_episode(new_proc_id)
+                    if new_ep:
+                        similar = find_similar_procedures(
+                            self.storage, self.embedder, new_ep['content'], threshold=0.80
+                        )
+                        for old_proc in similar:
+                            if old_proc['id'] != new_proc_id:
+                                self.storage.supersede_episode(old_proc['id'], new_proc_id)
+                                logger.info(
+                                    f"Procedure {old_proc['id']} superseded by {new_proc_id}"
+                                )
+                                break  # supersede only the most similar one
+
+                # Effectiveness tracking: correlate injected procedures with session errors
+                # Procedures injected this session = those accessed recently (last_accessed
+                # within session window) with role='procedural'
+                session_row = self.storage.get_session(session_id)
+                if session_row and session_eps:
+                    session_start = session_row.get('started_at', 0)
+                    injected_ids = [
+                        ep['id'] for ep in self.storage.get_all_episodes(consolidated=None)
+                        if ep.get('role') == 'procedural'
+                        and ep.get('last_accessed') is not None
+                        and ep['last_accessed'] >= session_start
+                        and ep.get('invalidated_at') is None
+                    ]
+                    if injected_ids:
+                        err_rate = compute_session_error_rate(session_eps)
+                        deltas = compute_effectiveness_deltas(injected_ids, err_rate)
+                        flagged = apply_effectiveness_updates(self.storage, deltas)
+                        stats['effectiveness_updates'] = len(deltas)
+                        for proc_id in flagged:
+                            self.storage.enqueue_review(
+                                episode_id=proc_id,
+                                review_type='low_effectiveness',
+                                reason='Procedure repeatedly associated with high error rates',
+                                priority=0.6,
+                            )
+            except Exception as e:
+                logger.warning(f"reflect: procedural extraction failed: {e}")
+
+        # 5. Consolidation
         try:
             consolidation_stats = self.consolidate()
             stats['consolidation'] = consolidation_stats
@@ -951,6 +1011,49 @@ class ARNv9:
 
         logger.info(f"Reflection complete: {stats}")
         return stats
+
+    def restore_procedure(self, episode_id: int) -> bool:
+        """
+        Restore an archived/superseded procedural memory.
+
+        Clears valid_until and superseded_by on the target episode,
+        and marks the superseding episode as invalidated so the old
+        procedure surfaces again in default recall.
+        """
+        ep = self.storage.get_episode(episode_id)
+        if ep is None:
+            return False
+        # Find the superseding episode and invalidate it
+        superseded_by = ep.get('superseded_by')
+        if superseded_by:
+            self.storage.invalidate_episode(superseded_by)
+        # Restore the target
+        self.storage.update_episode(episode_id, {
+            'valid_until': None,
+            'superseded_by': None,
+            'invalidated_at': None,
+        })
+        logger.info(f"Restored procedure {episode_id} (superseded by {superseded_by})")
+        return True
+
+    def deep_reflect(self, session_id: str = None) -> dict:
+        """
+        Extended periodic reflection — runs everything in reflect() plus
+        procedure-specific curator passes:
+
+        1. All standard reflect() passes
+        2. Stale detection: zero-access procedures older than 30 days → importance 0.1
+        3. Duplicate merging: sim > 0.9 procedure pairs → keep better, supersede other
+        4. Archival: importance < 0.15 + age > 60 days → set valid_until = now
+
+        Designed to run every N sessions (caller controls frequency) or on demand.
+        Returns a combined stats dict.
+        """
+        from .procedural import deep_reflect_procedures
+
+        base_stats = self.reflect(session_id=session_id)
+        curator_stats = deep_reflect_procedures(self.storage, self.embedder)
+        return {**base_stats, 'curator': curator_stats}
 
     def get_pending_reviews(self, limit: int = 10) -> List[dict]:
         """Return open review items from the review queue."""
