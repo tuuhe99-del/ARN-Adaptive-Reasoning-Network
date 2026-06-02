@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ARN Dashboard</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@3.0.0/tabler-icons.min.css">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+:root {
+  --bg: #0f1117; --surface: #1a1d27; --border: #2a2d3e;
+  --text: #e2e8f0; --muted: #64748b; --accent: #6366f1;
+  --ok: #10b981; --warn: #f59e0b; --err: #ef4444;
+  --r-user: #3b82f6; --r-assistant: #8b5cf6; --r-tool: #f59e0b;
+  --r-proc: #10b981; --r-result: #94a3b8;
+}
+@media (prefers-color-scheme: light) {
+  :root { --bg: #f8fafc; --surface: #fff; --border: #e2e8f0;
+          --text: #0f172a; --muted: #94a3b8; }
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: system-ui,sans-serif; font-size: 13px; background: var(--bg); color: var(--text); height: 100vh; display: flex; flex-direction: column; }
+header { display: flex; align-items: center; gap: 10px; padding: 8px 16px; background: var(--surface); border-bottom: 1px solid var(--border); flex-shrink: 0; }
+header h1 { font-size: 14px; font-weight: 600; }
+#status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--err); transition: background .3s; }
+#status-dot.ok { background: var(--ok); }
+#status-label { font-size: 11px; color: var(--muted); margin-right: auto; }
+header button { padding: 4px 10px; border: 1px solid var(--border); background: var(--surface); color: var(--text); border-radius: 5px; cursor: pointer; font-size: 12px; display: flex; align-items: center; gap: 4px; }
+header button:hover { border-color: var(--accent); color: var(--accent); }
+nav { display: flex; gap: 2px; padding: 6px 16px; background: var(--surface); border-bottom: 1px solid var(--border); flex-shrink: 0; }
+nav button { padding: 4px 12px; border: none; background: none; color: var(--muted); cursor: pointer; border-radius: 4px; font-size: 12px; font-weight: 500; }
+nav button.active { background: var(--accent); color: #fff; }
+nav button:hover:not(.active) { background: var(--border); color: var(--text); }
+main { flex: 1; overflow: hidden; }
+section { display: none; height: 100%; overflow-y: auto; padding: 16px; }
+section.active { display: block; }
+.metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px,1fr)); gap: 10px; margin-bottom: 16px; }
+.metric { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; }
+.metric .val { font-size: 22px; font-weight: 700; }
+.metric .lbl { font-size: 11px; color: var(--muted); margin-top: 2px; }
+.charts { display: grid; grid-template-columns: 260px 1fr; gap: 12px; margin-bottom: 16px; }
+@media (max-width: 700px) { .charts { grid-template-columns: 1fr; } }
+.chart-box { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
+.chart-box h3 { font-size: 11px; color: var(--muted); margin-bottom: 8px; text-transform: uppercase; letter-spacing: .05em; }
+canvas { max-height: 160px; }
+.proc-summary { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 12px; font-size: 12px; }
+.proc-summary b { color: var(--text); }
+.proc-summary span { color: var(--muted); }
+.feed-controls { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+.feed-controls label { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 4px; cursor: pointer; }
+#feed-list { display: flex; flex-direction: column; gap: 3px; }
+.feed-item { display: grid; grid-template-columns: 58px 80px 90px 1fr; align-items: start; gap: 8px; padding: 6px 8px; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; font-size: 12px; }
+.feed-item .time { color: var(--muted); font-variant-numeric: tabular-nums; }
+.feed-item .content { color: var(--text); word-break: break-word; line-height: 1.4; }
+.search-bar { display: flex; gap: 8px; margin-bottom: 12px; }
+.search-bar input, .search-bar select { flex: 1; padding: 7px 10px; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; color: var(--text); font-size: 13px; }
+.search-bar input { flex: 3; }
+.search-bar button { padding: 7px 14px; background: var(--accent); border: none; border-radius: 6px; color: #fff; cursor: pointer; font-size: 13px; }
+#exp-results, #dbg-results, #sess-list, #rev-list, #proc-list { display: flex; flex-direction: column; gap: 8px; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
+.card-header { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 11px; color: var(--muted); }
+.card-content { font-size: 13px; line-height: 1.5; word-break: break-word; }
+.card-footer { display: flex; align-items: center; gap: 6px; margin-top: 8px; }
+.badge { display: inline-flex; align-items: center; padding: 1px 7px; border-radius: 3px; font-size: 10px; font-weight: 600; text-transform: uppercase; }
+.b-user { background: #1d3a5e; color: var(--r-user); }
+.b-assistant { background: #2d1b4e; color: var(--r-assistant); }
+.b-tool_call,.b-tool { background: #3d2800; color: var(--r-tool); }
+.b-tool_result,.b-result { background: #1a2535; color: var(--r-result); }
+.b-procedural { background: #0d2e1e; color: var(--r-proc); }
+.b-user_identity { background: #1d3a5e; color: #60a5fa; }
+.b-pinned { background: #2d1b4e; color: #a78bfa; }
+.b-high { background: #0d2e1e; color: var(--ok); }
+.b-medium { background: #2e2000; color: var(--warn); }
+.b-low { background: #2e1010; color: var(--err); }
+.btn-sm { padding: 3px 8px; border: 1px solid var(--border); background: none; border-radius: 4px; color: var(--muted); cursor: pointer; font-size: 11px; }
+.btn-sm:hover { color: var(--text); border-color: var(--text); }
+.btn-sm.danger:hover { color: var(--err); border-color: var(--err); }
+.dbg-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.dbg-table th { text-align: left; padding: 6px 8px; color: var(--muted); font-weight: 600; border-bottom: 1px solid var(--border); font-size: 11px; text-transform: uppercase; }
+.dbg-table td { padding: 5px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+.dbg-table tr.gap-row td { background: var(--border); color: var(--muted); text-align: center; font-size: 11px; padding: 3px; }
+.dbg-table tr.below-gap td { opacity: .55; }
+.dbg-meta { display: flex; align-items: center; gap: 12px; font-size: 12px; color: var(--muted); margin-bottom: 10px; }
+.dbg-meta span { color: var(--text); font-weight: 600; }
+.sess-row { display: flex; align-items: center; gap: 10px; padding: 10px 12px; }
+.sess-row button { margin-left: auto; }
+.sess-detail { padding: 10px 0; }
+.sess-detail .ep { padding: 4px 8px; font-size: 12px; border-left: 2px solid var(--border); margin: 2px 0; }
+.rev-item { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
+.rev-header { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.rev-actions { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+.empty { padding: 24px; text-align: center; color: var(--muted); font-size: 13px; }
+.loading { padding: 24px; text-align: center; color: var(--muted); }
+</style>
+</head>
+<body class="arn-dash">
+<header>
+  <div id="status-dot"></div>
+  <h1>ARN Dashboard</h1>
+  <span id="status-label">connecting…</span>
+  <button onclick="triggerReflect()"><i class="ti ti-refresh"></i> Reflect</button>
+  <button onclick="exportData()"><i class="ti ti-download"></i> Export</button>
+</header>
+<nav>
+  <button class="active" onclick="tab('stats',this)">Overview</button>
+  <button onclick="tab('feed',this)">Feed</button>
+  <button onclick="tab('explorer',this)">Explorer</button>
+  <button onclick="tab('debugger',this)">Debugger</button>
+  <button onclick="tab('sessions',this)">Sessions</button>
+  <button onclick="tab('reviews',this)">Reviews</button>
+  <button onclick="tab('procedures',this)">Procedures</button>
+</nav>
+<main>
+<section id="tab-stats" class="active">
+  <div class="metrics">
+    <div class="metric"><div class="val" id="m-eps">—</div><div class="lbl">Episodes</div></div>
+    <div class="metric"><div class="val" id="m-today">—</div><div class="lbl">Today</div></div>
+    <div class="metric"><div class="val" id="m-sess">—</div><div class="lbl">Sessions</div></div>
+    <div class="metric"><div class="val" id="m-db">—</div><div class="lbl">DB size</div></div>
+    <div class="metric"><div class="val" id="m-lat">—</div><div class="lbl">Avg recall ms</div></div>
+    <div class="metric"><div class="val" id="m-rev">—</div><div class="lbl">Reviews pending</div></div>
+  </div>
+  <div class="charts">
+    <div class="chart-box"><h3>Roles</h3><canvas id="chart-roles"></canvas></div>
+    <div class="chart-box"><h3>Recall latency — last 50 calls (ms)</h3><canvas id="chart-lat"></canvas></div>
+  </div>
+  <div class="proc-summary" id="proc-summary">—</div>
+</section>
+<section id="tab-feed">
+  <div class="feed-controls">
+    <label><input type="checkbox" id="feed-auto" checked> Auto-scroll</label>
+    <span style="color:var(--muted);font-size:11px" id="feed-count"></span>
+  </div>
+  <div id="feed-list"><div class="loading">Loading…</div></div>
+</section>
+<section id="tab-explorer">
+  <div class="search-bar">
+    <input id="exp-query" placeholder="Search memories…" onkeydown="if(event.key==='Enter')searchMem()">
+    <select id="exp-role"><option value="">All roles</option><option value="user">user</option><option value="assistant">assistant</option><option value="tool_call">tool_call</option><option value="procedural">procedural</option><option value="user_identity">user_identity</option></select>
+    <button onclick="searchMem()"><i class="ti ti-search"></i> Search</button>
+  </div>
+  <div id="exp-results"><div class="empty">Type a query above to search memories.</div></div>
+</section>
+<section id="tab-debugger">
+  <div class="search-bar" style="margin-bottom:8px">
+    <input id="dbg-query" placeholder="Query to debug retrieval pipeline…" onkeydown="if(event.key==='Enter')debugQuery()">
+    <button onclick="debugQuery()"><i class="ti ti-player-play"></i> Run Pipeline</button>
+  </div>
+  <div class="dbg-meta" id="dbg-meta" style="display:none">
+    Latency: <span id="dbg-lat">—</span>ms &nbsp;·&nbsp; Gap at rank: <span id="dbg-gap">—</span>
+  </div>
+  <div id="dbg-results"></div>
+</section>
+<section id="tab-sessions">
+  <div id="sess-list"><div class="loading">Loading…</div></div>
+</section>
+<section id="tab-reviews">
+  <div id="rev-list"><div class="loading">Loading…</div></div>
+</section>
+<section id="tab-procedures">
+  <div id="proc-list"><div class="loading">Loading…</div></div>
+</section>
+</main>
+<script>
+const API = window.location.origin;
+let connected = false;
+
+async function api(path, opts={}) {
+  try {
+    const r = await fetch(API+path, {...opts, signal: AbortSignal.timeout(4000)});
+    if (!r.ok) throw new Error(r.status);
+    connected = true;
+    document.getElementById('status-dot').className = 'ok';
+    document.getElementById('status-label').textContent = 'connected';
+    return await r.json();
+  } catch(e) {
+    connected = false;
+    document.getElementById('status-dot').className = '';
+    document.getElementById('status-label').textContent = 'disconnected';
+    return null;
+  }
+}
+
+function post(path, body) {
+  return api(path, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+}
+
+// ── Tab switching ──────────────────────────────────────────
+function tab(id, btn) {
+  document.querySelectorAll('section').forEach(s => s.classList.remove('active'));
+  document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
+  document.getElementById('tab-'+id).classList.add('active');
+  btn.classList.add('active');
+  if (id==='sessions') loadSessions();
+  if (id==='reviews') loadReviews();
+  if (id==='procedures') loadProcedures();
+}
+
+// ── Role badge ─────────────────────────────────────────────
+function badge(role, extra='') {
+  const safe = (role||'unknown').replace(/[^a-z_]/g,'');
+  return `<span class="badge b-${safe}">${role||'?'}</span>${extra}`;
+}
+
+// ── Stats ──────────────────────────────────────────────────
+let rolesChart, latChart;
+
+function initCharts(d) {
+  const roles = d.episodes.by_role;
+  const rLabels = Object.keys(roles);
+  const rVals = Object.values(roles);
+  const roleColors = {user:'#3b82f6',assistant:'#8b5cf6',tool_call:'#f59e0b',
+                      tool_result:'#94a3b8',procedural:'#10b981',user_identity:'#60a5fa'};
+  const rColors = rLabels.map(l => roleColors[l]||'#64748b');
+
+  if (rolesChart) rolesChart.destroy();
+  rolesChart = new Chart(document.getElementById('chart-roles'), {
+    type:'doughnut',
+    data:{labels:rLabels, datasets:[{data:rVals, backgroundColor:rColors, borderWidth:0}]},
+    options:{plugins:{legend:{position:'bottom', labels:{color:'#94a3b8',font:{size:10},boxWidth:10}}}, cutout:'65%'}
+  });
+
+  const lats = d.recall_latency.recent_50;
+  if (latChart) latChart.destroy();
+  latChart = new Chart(document.getElementById('chart-lat'), {
+    type:'line',
+    data:{labels: lats.map((_,i)=>i+1), datasets:[{data:lats, borderColor:'#6366f1', borderWidth:1.5,
+          fill:true, backgroundColor:'rgba(99,102,241,.1)', tension:.3, pointRadius:0}]},
+    options:{scales:{x:{display:false}, y:{ticks:{color:'#64748b',font:{size:10}}, grid:{color:'#2a2d3e'}}},
+             plugins:{legend:{display:false}}}
+  });
+}
+
+async function loadStats() {
+  const d = await api('/dashboard/stats');
+  if (!d) return;
+  document.getElementById('m-eps').textContent = d.episodes.total.toLocaleString();
+  document.getElementById('m-today').textContent = d.episodes.today;
+  document.getElementById('m-sess').textContent = d.sessions.total;
+  document.getElementById('m-db').textContent = d.db_size_mb+'MB';
+  document.getElementById('m-lat').textContent = d.recall_latency.avg_ms;
+  document.getElementById('m-rev').textContent = d.reviews_pending;
+  const p = d.procedures;
+  document.getElementById('proc-summary').innerHTML =
+    `<b>Procedures:</b> ${p.total} total &nbsp;·&nbsp; ${p.active} active &nbsp;·&nbsp; ` +
+    `${p.stale} stale &nbsp;·&nbsp; avg effectiveness: <b>${p.avg_effectiveness}</b>`;
+  initCharts(d);
+}
+
+// ── Feed ───────────────────────────────────────────────────
+let lastTs = null, feedCount = 0;
+
+function roleColor(r) {
+  const m={user:'var(--r-user)',assistant:'var(--r-assistant)',tool_call:'var(--r-tool)',
+           tool_result:'var(--r-result)',procedural:'var(--r-proc)'};
+  return m[r]||'var(--muted)';
+}
+
+function prependFeed(eps) {
+  const list = document.getElementById('feed-list');
+  if (list.querySelector('.loading,.empty')) list.innerHTML = '';
+  for (const e of eps) {
+    const div = document.createElement('div');
+    div.className = 'feed-item';
+    div.innerHTML = `<span class="time">${e.time}</span>` +
+      `<span style="color:${roleColor(e.role)};font-weight:600">${e.role}</span>` +
+      `<span style="color:var(--muted)">${e.session_id||''}</span>` +
+      `<span class="content">${esc(e.content)}</span>`;
+    list.prepend(div);
+  }
+  feedCount += eps.length;
+  document.getElementById('feed-count').textContent = feedCount + ' items';
+  if (document.getElementById('feed-auto').checked) list.scrollTop = 0;
+  if (list.children.length > 200) while (list.children.length > 200) list.lastChild.remove();
+}
+
+async function pollFeed() {
+  const url = lastTs ? `/dashboard/feed?limit=50&since=${lastTs}` : '/dashboard/feed?limit=50';
+  const d = await api(url);
+  if (d?.episodes?.length) {
+    lastTs = d.episodes[0].timestamp;
+    prependFeed(d.episodes);
+  }
+}
+
+// ── Explorer ───────────────────────────────────────────────
+async function searchMem() {
+  const q = document.getElementById('exp-query').value.trim();
+  if (!q) return;
+  document.getElementById('exp-results').innerHTML = '<div class="loading">Searching…</div>';
+  const d = await post('/dashboard/search', {query:q, role_filter: document.getElementById('exp-role').value ? [document.getElementById('exp-role').value] : null, top_k:20});
+  if (!d) { document.getElementById('exp-results').innerHTML = '<div class="empty">Error fetching results.</div>'; return; }
+  renderExplorer(d.results);
+}
+
+function renderExplorer(results) {
+  const el = document.getElementById('exp-results');
+  if (!results.length) { el.innerHTML = '<div class="empty">No results.</div>'; return; }
+  el.innerHTML = results.map(r => `
+    <div class="card" id="card-${r.id}">
+      <div class="card-header">
+        ${badge(r.role)} <span class="badge b-${r.confidence}">${r.confidence}</span>
+        ${r.pinned ? '<span class="badge b-pinned"><i class="ti ti-pin"></i> pinned</span>' : ''}
+        <span style="margin-left:auto">${r.age_label} · imp ${r.importance} · accessed ${r.access_count}×</span>
+      </div>
+      <div class="card-content">${esc(r.content)}</div>
+      <div class="card-footer">
+        <button class="btn-sm" onclick="pinMem(${r.id},${r.pinned})">${r.pinned?'Unpin':'Pin'}</button>
+        <button class="btn-sm danger" onclick="forgetMem(${r.id})">Forget</button>
+        <span style="margin-left:auto;color:var(--muted);font-size:11px">score ${r.score}</span>
+      </div>
+    </div>`).join('');
+}
+
+async function pinMem(id, pinned) {
+  await post(pinned ? '/dashboard/unpin' : '/dashboard/pin', {episode_id: id});
+  searchMem();
+}
+
+async function forgetMem(id) {
+  if (!confirm('Soft-delete this memory?')) return;
+  await post('/dashboard/forget', {episode_id: id});
+  const c = document.getElementById('card-'+id);
+  if (c) c.remove();
+}
+
+// ── Debugger ───────────────────────────────────────────────
+async function debugQuery() {
+  const q = document.getElementById('dbg-query').value.trim();
+  if (!q) return;
+  document.getElementById('dbg-results').innerHTML = '<div class="loading">Running pipeline…</div>';
+  const d = await post('/dashboard/search', {query:q, top_k:15, include_scores:true});
+  if (!d) { document.getElementById('dbg-results').innerHTML = '<div class="empty">Error.</div>'; return; }
+  const meta = document.getElementById('dbg-meta');
+  meta.style.display = 'flex';
+  document.getElementById('dbg-lat').textContent = d.query_latency_ms;
+  document.getElementById('dbg-gap').textContent = d.gap_index;
+  renderDebug(d.results, d.gap_index);
+}
+
+function renderDebug(results, gapIdx) {
+  if (!results.length) { document.getElementById('dbg-results').innerHTML = '<div class="empty">No results.</div>'; return; }
+  let rows = results.map((r, i) => {
+    const s = r.scores || {};
+    const cls = i >= gapIdx ? 'below-gap' : '';
+    return `<tr class="${cls}">
+      <td>${i+1}</td><td>${badge(r.role)}</td>
+      <td style="max-width:280px;word-break:break-word">${esc(r.content.substring(0,120))}</td>
+      <td>${fmt(s.vector)}</td><td>${fmt(s.fts5)}</td><td>${fmt(s.rrf)}</td>
+      <td>${fmt(s.recency)}</td><td style="font-weight:600">${fmt(s.final)}</td>
+    </tr>`;
+  });
+  // Insert gap row
+  if (gapIdx < results.length) {
+    rows.splice(gapIdx, 0, `<tr class="gap-row"><td colspan="8">━━━  gap cut  ━━━</td></tr>`);
+  }
+  document.getElementById('dbg-results').innerHTML = `
+    <table class="dbg-table">
+      <thead><tr><th>#</th><th>Role</th><th>Content</th><th>Vec</th><th>FTS5</th><th>RRF</th><th>Rec</th><th>Final</th></tr></thead>
+      <tbody>${rows.join('')}</tbody>
+    </table>`;
+}
+
+// ── Sessions ───────────────────────────────────────────────
+async function loadSessions() {
+  const d = await api('/dashboard/sessions?limit=20');
+  const el = document.getElementById('sess-list');
+  if (!d?.sessions?.length) { el.innerHTML = '<div class="empty">No sessions yet.</div>'; return; }
+  el.innerHTML = d.sessions.map(s => {
+    const started = s.started_at ? new Date(s.started_at*1000).toLocaleString() : '?';
+    const status = s.ended_at ? 'ended' : 'active';
+    return `<div class="card">
+      <div class="sess-row">
+        <span style="font-weight:600;font-size:12px">${esc(s.id)}</span>
+        <span class="badge ${status==='active'?'b-high':'b-result'}">${status}</span>
+        <span style="color:var(--muted)">${s.episode_count||0} episodes</span>
+        <span style="color:var(--muted);font-size:11px">${started}</span>
+        <button class="btn-sm" onclick="showSessDetail('${esc(s.id)}',this)">Detail ▶</button>
+      </div>
+      <div class="sess-detail" id="sd-${esc(s.id)}" style="display:none"></div>
+    </div>`;
+  }).join('');
+}
+
+async function showSessDetail(sessId, btn) {
+  const det = document.getElementById('sd-'+sessId);
+  if (det.style.display !== 'none') { det.style.display = 'none'; btn.textContent = 'Detail ▶'; return; }
+  det.style.display = 'block';
+  btn.textContent = 'Hide ▲';
+  det.innerHTML = '<div class="loading">Loading…</div>';
+  const d = await api('/session/'+encodeURIComponent(sessId));
+  if (!d) { det.innerHTML = '<div class="empty">Error.</div>'; return; }
+  const eps = await api('/dashboard/feed?limit=200&since=0');
+  const sesEps = (eps?.episodes||[]).filter(e=>e.session_id===sessId);
+  if (!sesEps.length) { det.innerHTML = '<div class="empty">No episodes in this session.</div>'; return; }
+  det.innerHTML = `<div style="font-size:11px;color:var(--muted);padding:4px 8px">Role breakdown: ${JSON.stringify(d.role_counts||{})}</div>` +
+    sesEps.slice(0,50).map(e => `<div class="ep" style="border-left-color:${roleColor(e.role)}">
+      <span style="color:var(--muted)">${e.time}</span> ${badge(e.role)} ${esc(e.content.substring(0,100))}</div>`).join('');
+}
+
+// ── Reviews ────────────────────────────────────────────────
+async function loadReviews() {
+  const d = await api('/dashboard/reviews');
+  const el = document.getElementById('rev-list');
+  if (!d?.reviews?.length) { el.innerHTML = '<div class="empty">No pending reviews.</div>'; return; }
+  el.innerHTML = d.reviews.map(r => `
+    <div class="rev-item" id="rev-${r.id}">
+      <div class="rev-header">
+        <span class="badge b-tool_call">${r.review_type}</span>
+        <span style="color:var(--muted)">episode ${r.episode_id}</span>
+        <span style="margin-left:auto;color:var(--warn)">priority ${(r.priority||0).toFixed(2)}</span>
+      </div>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:4px">${esc(r.reason||'')}</div>
+      <div class="card-content">${esc((r.content||'').substring(0,200))}</div>
+      <div class="rev-actions">
+        <button class="btn-sm" onclick="resolve(${r.id},'keep_both')">Keep both</button>
+        <button class="btn-sm" onclick="resolve(${r.id},'delete')">Delete</button>
+        <button class="btn-sm" onclick="resolve(${r.id},'pin')">Pin</button>
+        <button class="btn-sm" onclick="resolve(${r.id},'defer')">Defer</button>
+      </div>
+    </div>`).join('');
+}
+
+async function resolve(id, action) {
+  const resolution = action==='update' ? (prompt('Correct information:')||'') : '';
+  await post('/dashboard/resolve', {review_id:id, action, resolution});
+  const el = document.getElementById('rev-'+id);
+  if (el) el.remove();
+}
+
+// ── Procedures ─────────────────────────────────────────────
+async function loadProcedures() {
+  const d = await api('/dashboard/procedures');
+  const el = document.getElementById('proc-list');
+  if (!d?.procedures?.length) { el.innerHTML = '<div class="empty">No procedural memories yet.</div>'; return; }
+  el.innerHTML = d.procedures.map(p => `
+    <div class="card">
+      <div class="card-header">
+        <span class="badge ${p.status==='active'?'b-high':'b-medium'}">${p.status}</span>
+        <span style="color:var(--muted)">${p.age_label} · ${p.steps} steps · ${p.failures} failures · accessed ${p.access_count}×</span>
+        <span style="margin-left:auto;color:var(--text)">eff ${p.effectiveness}</span>
+      </div>
+      <div class="card-content">${esc(p.goal)}</div>
+    </div>`).join('');
+}
+
+// ── Global actions ─────────────────────────────────────────
+async function triggerReflect() {
+  const btn = event.currentTarget;
+  btn.disabled = true;
+  const d = await post('/dashboard/reflect', {});
+  btn.disabled = false;
+  if (d) {
+    alert(`Reflect done.\nContradictions: ${d.contradictions_found||0}\nProcedures: ${d.procedures_extracted||0}`);
+    loadReviews();
+    loadStats();
+  }
+}
+
+function exportData() {
+  api('/dashboard/stats').then(d => {
+    const blob = new Blob([JSON.stringify(d, null, 2)], {type:'application/json'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'arn-stats-'+Date.now()+'.json';
+    a.click();
+  });
+}
+
+// ── Utilities ──────────────────────────────────────────────
+function esc(s) {
+  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function fmt(v) { return v==null ? '—' : Number(v).toFixed(3); }
+
+// ── Bootstrap ──────────────────────────────────────────────
+loadStats();
+pollFeed();
+setInterval(pollFeed, 2000);
+setInterval(loadStats, 10000);
+</script>
+</body>
+</html>

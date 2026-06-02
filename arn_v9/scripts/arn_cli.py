@@ -803,8 +803,11 @@ def cmd_server(args):
             print("--daemon is not supported on Windows. Run without --daemon.")
             sys.exit(1)
         _start_daemon(args.host, args.port)
+        print(f"Dashboard: http://localhost:{args.port}/dashboard")
         return
 
+    print(f"ARN memory server started on port {args.port}")
+    print(f"Dashboard: http://localhost:{args.port}/dashboard")
     import uvicorn
     uvicorn.run(
         "arn_v9.api.server:app",

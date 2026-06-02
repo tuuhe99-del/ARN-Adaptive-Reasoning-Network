@@ -42,7 +42,7 @@ import secrets
 import threading as _threading
 from typing import Optional, List
 from contextlib import asynccontextmanager
-from collections import defaultdict
+from collections import defaultdict, deque
 from pathlib import Path as _Path
 
 try:
@@ -329,6 +329,9 @@ ARN_PRUNE_THRESHOLD        = float(os.environ.get("ARN_PRUNE_THRESHOLD", "0.05")
 ARN_CONSOLIDATE_INTERVAL_SECONDS = int(os.environ.get("ARN_CONSOLIDATE_INTERVAL_SECONDS", str(6 * 3600)))  # default 6h
 ARN_CONSOLIDATE_THRESHOLD        = float(os.environ.get("ARN_CONSOLIDATE_THRESHOLD", "0.85"))  # cosine sim threshold
 ARN_CONSOLIDATE_MIN_CLUSTER      = int(os.environ.get("ARN_CONSOLIDATE_MIN_CLUSTER", "2"))     # min cluster size to merge
+
+# Ring buffer of the last 50 recall latencies (ms) — polled by /dashboard/stats
+_recall_latency_deque: deque = deque(maxlen=50)
 
 
 # Auto-generate API key if none is set
@@ -736,12 +739,8 @@ app.add_middleware(
 )
 
 
-# Load dashboard HTML from file at import time
-_dashboard_path = _Path(__file__).with_name("dashboard.html")
-try:
-    DASHBOARD_HTML = _dashboard_path.read_text()
-except Exception:
-    DASHBOARD_HTML = "<html><body>Dashboard unavailable</body></html>"
+# Dashboard HTML — served from arn_v9/dashboard/index.html
+_dashboard_file = _Path(__file__).parent.parent / "dashboard" / "index.html"
 
 
 # =========================================================
@@ -761,8 +760,11 @@ async def verify_api_key(x_api_key: Optional[str] = Header(None)):
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
-    """Local R&D dashboard for browsing ARN memories."""
-    return HTMLResponse(DASHBOARD_HTML.replace("{{ graph_mode }}", GRAPH_MODE))
+    """Real-time diagnostic dashboard."""
+    if _dashboard_file.exists():
+        return HTMLResponse(_dashboard_file.read_text())
+    return HTMLResponse("<html><body><h2>Dashboard not found</h2>"
+                        "<p>Expected: arn_v9/dashboard/index.html</p></body></html>", status_code=404)
 
 
 @app.get("/v1/health", response_model=HealthResponse)
@@ -1675,6 +1677,7 @@ async def plugin_perceive(req: PerceiveRequest):
 @app.post("/recall")
 async def plugin_recall(req: PluginRecallRequest):
     """Recall memories for the OpenClaw plugin."""
+    _t0 = time.perf_counter()
     plugin = pool.get(DEFAULT_AGENT_ID)
     arn = plugin._arn
     storage = arn.storage
@@ -1731,6 +1734,7 @@ async def plugin_recall(req: PluginRecallRequest):
     for r in results:
         await asyncio.to_thread(storage.update_episode_access, r['id'])
 
+    _recall_latency_deque.append(round((time.perf_counter() - _t0) * 1000, 1))
     return {"results": results, "count": len(results)}
 
 
@@ -1855,6 +1859,343 @@ async def reviews_resolve(req: ResolveReviewRequest):
 
 
 # =========================================================
+# DASHBOARD API ENDPOINTS
+# =========================================================
+
+class DashboardSearchRequest(BaseModel):
+    query: str = Field(..., min_length=1, max_length=5000)
+    role_filter: Optional[List[str]] = None
+    top_k: int = Field(20, ge=1, le=50)
+    include_scores: bool = False
+
+
+def _parse_procedure_content(content: str) -> dict:
+    """Extract goal, step count, failure count from structured procedure text."""
+    goal, steps, failures = '', 0, 0
+    section = None
+    for line in content.split('\n'):
+        if line.startswith('GOAL:'):
+            goal = line[5:].strip()
+        elif line.startswith('STEPS:'):
+            section = 'steps'
+        elif line.startswith('FAILURES:'):
+            section = 'failures'
+        elif line.startswith('VERIFICATION:') or line.startswith('CONTEXT:'):
+            section = None
+        elif section == 'steps' and line.strip() and line.strip()[0].isdigit():
+            steps += 1
+        elif section == 'failures' and line.strip().startswith('- Tried:'):
+            failures += 1
+    return {'goal': goal or content[:80], 'steps': steps, 'failures': failures}
+
+
+def _find_gap_index(results: list) -> int:
+    """Return the rank position where the largest relative score gap occurs."""
+    if len(results) <= 1:
+        return len(results)
+    scores = [r['score'] for r in results]
+    score_range = scores[0] - scores[-1]
+    if score_range < 1e-6:
+        return min(len(results), 5)
+    check_n = min(len(scores), 15)
+    best_gap, best_cut = 0.0, min(len(results), 5)
+    for i in range(1, check_n):
+        gap = (scores[i - 1] - scores[i]) / score_range
+        if gap >= 0.15 and gap > best_gap:
+            best_gap, best_cut = gap, i
+    return best_cut
+
+
+def _get_default_storage():
+    """Get storage for the default agent, initializing if needed."""
+    return pool.get(DEFAULT_AGENT_ID)._arn
+
+
+@app.get("/dashboard/stats")
+async def dashboard_stats():
+    """Stats snapshot for the dashboard overview panel."""
+    arn = _get_default_storage()
+    storage = arn.storage
+    conn = storage._get_conn()
+
+    # Episode counts by role (active only)
+    by_role = {}
+    for row in conn.execute(
+        "SELECT role, COUNT(*) FROM episodes WHERE invalidated_at IS NULL GROUP BY role"
+    ).fetchall():
+        by_role[row[0] or 'unknown'] = row[1]
+
+    total_active = sum(by_role.values())
+
+    today_ts = time.time() - (time.time() % 86400)  # start of today UTC
+    today_count = conn.execute(
+        "SELECT COUNT(*) FROM episodes WHERE created_at > ? AND invalidated_at IS NULL",
+        (today_ts,)
+    ).fetchone()[0]
+
+    active_sessions = conn.execute(
+        "SELECT COUNT(*) FROM sessions WHERE ended_at IS NULL"
+    ).fetchone()[0]
+    total_sessions = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+
+    # Procedural memory stats
+    proc_rows = conn.execute(
+        "SELECT metadata FROM episodes WHERE role='procedural' AND invalidated_at IS NULL"
+    ).fetchall()
+    proc_total = len(proc_rows)
+    eff_scores = []
+    stale = 0
+    for row in proc_rows:
+        try:
+            meta = json.loads(row[0]) if row[0] else {}
+            eff = meta.get('effectiveness_score', 1.0)
+            eff_scores.append(float(eff))
+            if eff < 0.3:
+                stale += 1
+        except Exception:
+            eff_scores.append(1.0)
+
+    avg_eff = round(sum(eff_scores) / len(eff_scores), 2) if eff_scores else 0.0
+
+    reviews_pending = conn.execute(
+        "SELECT COUNT(*) FROM memory_review_queue WHERE resolved_at IS NULL"
+    ).fetchone()[0]
+
+    db_size_mb = round(storage.get_storage_stats()['total_size_mb'], 2)
+    latencies = list(_recall_latency_deque)
+    avg_lat = round(sum(latencies) / len(latencies), 1) if latencies else 0.0
+    p99_lat = round(sorted(latencies)[int(len(latencies) * 0.99)] if len(latencies) > 1 else avg_lat, 1)
+
+    return {
+        "status": "ok",
+        "uptime_seconds": round(time.time() - start_time, 1),
+        "port": int(os.environ.get("ARN_PORT", "7900")),
+        "db_size_mb": db_size_mb,
+        "episodes": {
+            "total": total_active,
+            "today": today_count,
+            "by_role": by_role,
+        },
+        "sessions": {"total": total_sessions, "active": active_sessions},
+        "procedures": {
+            "total": proc_total,
+            "active": proc_total - stale,
+            "stale": stale,
+            "avg_effectiveness": avg_eff,
+        },
+        "reviews_pending": reviews_pending,
+        "recall_latency": {
+            "avg_ms": avg_lat,
+            "p99_ms": p99_lat,
+            "recent_50": latencies,
+        },
+    }
+
+
+@app.get("/dashboard/feed")
+async def dashboard_feed(limit: int = 50, since: Optional[float] = None):
+    """Activity feed — recent episodes in chronological order."""
+    arn = _get_default_storage()
+    conn = arn.storage._get_conn()
+
+    if since is not None:
+        rows = conn.execute(
+            "SELECT id, created_at, role, content, session_id, importance, pinned "
+            "FROM episodes WHERE invalidated_at IS NULL AND created_at > ? "
+            "ORDER BY created_at DESC LIMIT ?",
+            (since, limit)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, created_at, role, content, session_id, importance, pinned "
+            "FROM episodes WHERE invalidated_at IS NULL "
+            "ORDER BY created_at DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+
+    import datetime
+    episodes = []
+    for r in rows:
+        ts = datetime.datetime.fromtimestamp(r[1]).strftime('%H:%M:%S') if r[1] else ''
+        episodes.append({
+            "id": r[0],
+            "time": ts,
+            "timestamp": r[1],
+            "role": r[2] or 'unknown',
+            "content": (r[3] or '')[:200],
+            "session_id": r[4],
+            "importance": round(r[5] or 0.5, 2),
+            "pinned": bool(r[6]),
+        })
+    return {"episodes": episodes}
+
+
+@app.post("/dashboard/search")
+async def dashboard_search(req: DashboardSearchRequest):
+    """Memory search with optional per-channel score breakdown."""
+    import math
+    _t0 = time.perf_counter()
+    arn = _get_default_storage()
+    storage = arn.storage
+
+    query_vec = await asyncio.to_thread(arn.embedder.encode, req.query, "query")
+    knn = await asyncio.to_thread(storage.knn_search, query_vec, req.top_k * 4)
+    fts = await asyncio.to_thread(storage.fts_search, req.query, req.top_k * 4)
+    ent = await asyncio.to_thread(storage.search_entities, req.query, req.top_k * 4)
+
+    from arn_v9.core.retrieval import fuse_rrf, recency_score
+    rrf = fuse_rrf(knn, fts, ent)
+    vec_scores = dict(knn)
+    fts_scores = dict(fts)
+    ent_scores = dict(ent)
+
+    episodes = {ep['id']: ep for ep in storage.get_episodes_by_ids(list(rrf.keys()))}
+
+    results = []
+    for ep_id, rrf_score in rrf.items():
+        ep = episodes.get(ep_id)
+        if ep is None or ep.get('invalidated_at'):
+            continue
+        if req.role_filter and ep.get('role') not in req.role_filter:
+            continue
+
+        rec = recency_score(ep['created_at']) if not ep.get('pinned') else 1.0
+        pin_boost = 0.15 if ep.get('pinned') else 0.0
+        freq = math.log1p(ep.get('access_count', 0)) * 0.05
+        final = rrf_score + rec * 0.3 + ep['importance'] * 0.15 + freq + pin_boost
+
+        effectiveness = None
+        if ep.get('role') == 'procedural':
+            try:
+                meta = ep.get('metadata') or {}
+                if isinstance(meta, str):
+                    meta = json.loads(meta)
+                effectiveness = meta.get('effectiveness_score')
+            except Exception:
+                pass
+
+        item: dict = {
+            'id': ep['id'],
+            'role': ep.get('role', 'user'),
+            'content': ep['content'],
+            'importance': round(ep['importance'], 3),
+            'pinned': bool(ep.get('pinned')),
+            'age_label': _age_label(ep['created_at']),
+            'access_count': ep.get('access_count', 0),
+            'confidence': 'high' if final > 0.4 else 'medium' if final > 0.2 else 'low',
+            'effectiveness': effectiveness,
+            'score': round(final, 4),
+        }
+        if req.include_scores:
+            item['scores'] = {
+                'vector': round(vec_scores.get(ep_id, 0.0), 4),
+                'fts5': round(fts_scores.get(ep_id, 0.0), 4),
+                'entity': round(ent_scores.get(ep_id, 0.0), 4),
+                'rrf': round(rrf_score, 4),
+                'recency': round(rec, 4),
+                'final': round(final, 4),
+            }
+        results.append(item)
+
+    results.sort(key=lambda r: r['score'], reverse=True)
+    results = results[:req.top_k]
+
+    latency_ms = round((time.perf_counter() - _t0) * 1000, 1)
+    _recall_latency_deque.append(latency_ms)
+
+    return {
+        'results': results,
+        'gap_index': _find_gap_index(results),
+        'query_latency_ms': latency_ms,
+    }
+
+
+@app.get("/dashboard/sessions")
+async def dashboard_sessions(limit: int = 20):
+    """Session list for the sessions panel."""
+    arn = _get_default_storage()
+    sessions = await asyncio.to_thread(arn.storage.get_recent_sessions, limit)
+    return {"sessions": sessions}
+
+
+@app.get("/dashboard/reviews")
+async def dashboard_reviews():
+    """Pending review items for the reviews panel."""
+    arn = _get_default_storage()
+    items = await asyncio.to_thread(arn.storage.get_pending_reviews, 50)
+    return {"reviews": items}
+
+
+@app.get("/dashboard/procedures")
+async def dashboard_procedures():
+    """Procedural memories with parsed content."""
+    arn = _get_default_storage()
+    conn = arn.storage._get_conn()
+    rows = conn.execute(
+        "SELECT id, content, metadata, importance, access_count, created_at "
+        "FROM episodes WHERE role='procedural' AND invalidated_at IS NULL "
+        "ORDER BY created_at DESC"
+    ).fetchall()
+
+    procs = []
+    for r in rows:
+        parsed = _parse_procedure_content(r[1] or '')
+        effectiveness = 1.0
+        try:
+            meta = json.loads(r[2]) if r[2] else {}
+            effectiveness = float(meta.get('effectiveness_score', 1.0))
+        except Exception:
+            pass
+        procs.append({
+            'id': r[0],
+            'goal': parsed['goal'],
+            'steps': parsed['steps'],
+            'failures': parsed['failures'],
+            'effectiveness': round(effectiveness, 2),
+            'access_count': r[4] or 0,
+            'age_label': _age_label(r[5]),
+            'status': 'stale' if effectiveness < 0.3 else 'active',
+        })
+    return {"procedures": procs}
+
+
+@app.post("/dashboard/pin")
+async def dashboard_pin(req: PinRequest):
+    return await plugin_pin(req)
+
+
+@app.post("/dashboard/unpin")
+async def dashboard_unpin(req: PinRequest):
+    return await plugin_unpin(req)
+
+
+@app.post("/dashboard/forget")
+async def dashboard_forget(req: ForgetRequest):
+    return await plugin_forget(req)
+
+
+@app.post("/dashboard/resolve")
+async def dashboard_resolve(req: ResolveReviewRequest):
+    return await reviews_resolve(req)
+
+
+@app.post("/dashboard/reflect")
+async def dashboard_reflect():
+    """Manually trigger post-session reflection."""
+    arn = _get_default_storage()
+    stats = await asyncio.to_thread(arn.reflect)
+    return stats
+
+
+@app.post("/dashboard/deep-reflect")
+async def dashboard_deep_reflect():
+    """Manually trigger deep reflection (curator pass)."""
+    arn = _get_default_storage()
+    stats = await asyncio.to_thread(arn.deep_reflect)
+    return stats
+
+
+# =========================================================
 # ERROR HANDLERS
 # =========================================================
 
@@ -1930,6 +2271,7 @@ def _daemon_status(port: int):
         resp = urllib.request.urlopen(f"http://localhost:{port}/v1/health", timeout=2)
         stats = _json.loads(resp.read())
         print(f"ARN daemon: running (PID {pid}, port {port})")
+        print(f"  Dashboard:   http://localhost:{port}/dashboard")
         print(f"  Episodes:    {stats.get('episodes', '?')}")
         print(f"  Sessions:    {stats.get('sessions', '?')}")
         print(f"  DB size:     {stats.get('db_size_mb', '?')} MB")
